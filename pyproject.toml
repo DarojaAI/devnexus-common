@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devnexus-common"
+version = "1.0.0"
+description = "Shared Python utilities for DarojaAI projects: PostgreSQL client, A2A client, and unified tracing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "DarojaAI"},
+]
+keywords = ["postgres", "a2a", "tracing", "gcp"]
+dependencies = [
+    "asyncpg>=0.29",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+tracing = [
+    "langfuse>=2.0",
+    "langsmith>=0.1",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["common*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
