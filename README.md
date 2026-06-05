@@ -15,6 +15,32 @@ pip install -e ".[tracing]"
 
 ## Modules
 
+### `common.llm` — LLM client
+
+Unified LLM client supporting Anthropic Claude and OpenRouter (with easy extensibility for other providers).
+
+```python
+from common.llm import get_llm_client_from_config, LLMClient
+
+# From config object (with llm_provider, anthropic_api_key, etc.)
+client = get_llm_client_from_config(config)
+
+# Or directly
+from common.llm import get_llm_client
+client = get_llm_client("anthropic", api_key="sk-ant-...")
+
+response = client.create_message(
+    model="claude-3-5-sonnet-20241022",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(response.content)
+print(response.usage)  # {"input_tokens": 10, "output_tokens": 50}
+```
+
+**Environment variables:**
+- `ANTHROPIC_API_KEY` — for Anthropic provider
+- `OPENROUTER_API_KEY` — for OpenRouter provider
+
 ### `common.db.postgres` — PostgreSQL client
 
 VPC-agnostic async PostgreSQL client with pgvector support. Connects via standard TCP using `POSTGRES_HOST` (or any host passed to the constructor). No VPC connector logic.

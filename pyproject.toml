@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "devnexus-common"
 version = "1.0.0"
-description = "Shared Python utilities for DarojaAI projects: PostgreSQL client, A2A client, and unified tracing."
+description = "Shared Python utilities for DarojaAI projects: PostgreSQL client, LLM client, A2A client, and unified tracing."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "DarojaAI"},
 ]
-keywords = ["postgres", "a2a", "tracing", "gcp"]
+keywords = ["postgres", "llm", "a2a", "tracing", "gcp"]
 dependencies = [
     "asyncpg>=0.29",
     "requests>=2.31",
