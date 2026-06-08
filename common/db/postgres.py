@@ -9,7 +9,7 @@ import asyncpg
 import logging
 import asyncio
 import ssl
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
@@ -425,6 +425,134 @@ class DatabaseManager:
         ]
 
 
+    # ============================================
+    # Sync facade
+    # ============================================
+    # Use these from SYNC contexts only (CLI scripts, sync request
+    # handlers, threadpool workers). The _run_sync guard raises if
+    # called from inside a running event loop — in async contexts,
+    # use the async methods directly.
+    #
+    # Implementation note: we bridge via asyncio.run() in a fresh
+    # loop. asyncpg's pool holds connections across runs, so this
+    # is safe — the pool itself persists; only the event loop is
+    # short-lived per call.
+
+    @staticmethod
+    def _run_sync(coro):
+        """Run a coroutine to completion in a fresh event loop.
+
+        Raises RuntimeError if called from a running event loop.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError as e:
+            if "no running event loop" in str(e):
+                return asyncio.run(coro)
+            raise
+        raise RuntimeError(
+            "DatabaseManager._run_sync called from a running event "
+            "loop. Use the async methods (execute, fetch, ...) "
+            "directly in async contexts."
+        )
+
+    def execute_sync(self, query: str, *args) -> str:
+        """Sync wrapper for execute(). See class docstring."""
+        return self._run_sync(self.execute(query, *args))
+
+    def fetch_sync(self, query: str, *args) -> "List[asyncpg.Record]":
+        """Sync wrapper for fetch(). See class docstring."""
+        return self._run_sync(self.fetch(query, *args))
+
+    def fetchrow_sync(self, query: str, *args) -> "Optional[asyncpg.Record]":
+        """Sync wrapper for fetchrow(). See class docstring."""
+        return self._run_sync(self.fetchrow(query, *args))
+
+    def fetchval_sync(self, query: str, *args) -> Any:
+        """Sync wrapper for fetchval(). See class docstring."""
+        return self._run_sync(self.fetchval(query, *args))
+
+    def health_check_sync(self) -> Dict[str, Any]:
+        """Sync wrapper for health_check(). See class docstring."""
+        return self._run_sync(self.health_check())
+
+    # ============================================
+    # Bulk insert (pgvector-aware, async — bridges via bulk_insert_sync)
+    # ============================================
+
+    async def bulk_insert(
+        self,
+        table: str,
+        columns: List[str],
+        rows: List[Tuple],
+        *,
+        on_conflict: Optional[str] = None,
+        page_size: int = 1000,
+    ) -> str:
+        """Insert many rows in batches of page_size. Equivalent to
+        psycopg2.extras.execute_values.
+
+        Args:
+            table: Target table name. Not quoted; caller is responsible
+                for ensuring the table name is safe (e.g., not from
+                untrusted user input).
+            columns: List of column names. Same safety caveat as table.
+            rows: Tuples of values, one per row. Each tuple's length
+                must equal len(columns).
+            on_conflict: Optional ON CONFLICT clause appended verbatim,
+                e.g. "ON CONFLICT (id) DO UPDATE SET x = EXCLUDED.x".
+            page_size: Rows per INSERT statement. asyncpg handles
+                1000s of params in one call; 1000 is a safe default.
+
+        Returns:
+            The total rows-inserted string, e.g. "INSERT 0 1042".
+        """
+        if not rows:
+            return "INSERT 0"
+        n = len(columns)
+        if any(len(r) != n for r in rows):
+            raise ValueError(
+                f"bulk_insert: every row must have exactly {n} values; "
+                f"got row lengths {[len(r) for r in rows]}"
+            )
+        cols = ", ".join(columns)
+        placeholders = ", ".join(f"${i+1}" for i in range(n))
+        sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+        if on_conflict:
+            sql += f" {on_conflict}"
+        await self.ensure_connected()
+        total = 0
+        from itertools import chain
+        for i in range(0, len(rows), page_size):
+            page = rows[i : i + page_size]
+            params = list(chain.from_iterable(page))
+            result = await self._with_retry(
+                lambda: self._execute_impl(sql, *params)
+            )
+            # asyncpg returns "INSERT 0 42" for inserts; the trailing
+            # number is rows-inserted. Parse defensively.
+            try:
+                total += int(result.rsplit(" ", 1)[-1])
+            except (ValueError, IndexError):
+                logger.debug(f"bulk_insert: could not parse row count from {result!r}")
+        return f"INSERT 0 {total}"
+
+    def bulk_insert_sync(
+        self,
+        table: str,
+        columns: List[str],
+        rows: List[Tuple],
+        *,
+        on_conflict: Optional[str] = None,
+        page_size: int = 1000,
+    ) -> str:
+        """Sync wrapper for bulk_insert()."""
+        return self._run_sync(
+            self.bulk_insert(table, columns, rows,
+                             on_conflict=on_conflict, page_size=page_size)
+        )
+
+
 # Singleton instance
 _db_manager: Optional[DatabaseManager] = None
 
@@ -448,3 +576,21 @@ async def close_db() -> None:
     """Close database connection."""
     db = get_db()
     await db.disconnect()
+
+
+def init_db_sync() -> DatabaseManager:
+    """Sync wrapper for init_db().
+
+    Use from sync contexts (CLI scripts, sync request handlers,
+    threadpool workers). For async contexts, use init_db() directly.
+    """
+    db = get_db()
+    db._run_sync(db.connect())
+    return db
+
+
+def close_db_sync() -> None:
+    """Sync wrapper for close_db(). See init_db_sync for usage."""
+    db = get_db()
+    if db.pool is not None:
+        db._run_sync(db.disconnect())
