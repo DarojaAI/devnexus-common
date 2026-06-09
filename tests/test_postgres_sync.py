@@ -392,7 +392,7 @@ def test_close_db_sync_closes_when_pool_present():
 
 def test_init_accepts_int_port():
     """port=5432 (int) must not raise; the natural Python type for a port."""
-    env = {"POSTGRES_HOST": "fake-host", "USE_POSTGRESQL": "false"}
+    env = {"POSTGRES_HOST": "fake-host"}
     with patch.dict(os.environ, env, clear=False):
         mgr = DatabaseManager(host="fake-host", port=5432)
     assert mgr.port == 5432
@@ -401,7 +401,7 @@ def test_init_accepts_int_port():
 
 def test_init_accepts_str_port():
     """port='5432' (str, e.g. from os.environ) must be coerced to int."""
-    env = {"POSTGRES_HOST": "fake-host", "USE_POSTGRESQL": "false"}
+    env = {"POSTGRES_HOST": "fake-host"}
     with patch.dict(os.environ, env, clear=False):
         mgr = DatabaseManager(host="fake-host", port="5432")
     assert mgr.port == 5432
@@ -410,7 +410,7 @@ def test_init_accepts_str_port():
 
 def test_init_port_none_uses_env_var():
     """port=None falls back to POSTGRES_PORT env var."""
-    env = {"POSTGRES_HOST": "fake-host", "POSTGRES_PORT": "6432", "USE_POSTGRESQL": "false"}
+    env = {"POSTGRES_HOST": "fake-host", "POSTGRES_PORT": "6432"}
     with patch.dict(os.environ, env, clear=False):
         mgr = DatabaseManager(host="fake-host", port=None)
     assert mgr.port == 6432
@@ -418,8 +418,33 @@ def test_init_port_none_uses_env_var():
 
 def test_init_port_none_default_when_env_unset():
     """port=None with POSTGRES_PORT unset uses the 5432 default."""
-    env = {"POSTGRES_HOST": "fake-host", "USE_POSTGRESQL": "false"}
+    env = {"POSTGRES_HOST": "fake-host"}
     with patch.dict(os.environ, env, clear=False):
         os.environ.pop("POSTGRES_PORT", None)
         mgr = DatabaseManager(host="fake-host", port=None)
+    assert mgr.port == 5432
+
+
+def test_init_default_use_postgresql_is_true():
+    """The facade exists to provide PG access — defaulting to enabled.
+
+    Regression: the previous default of 'false' silently disabled every
+    downstream that didn't set USE_POSTGRESQL=true explicitly. First caught
+    when rag_research_tool's wiki /db-status returned 'PostgreSQL is disabled'
+    even though POSTGRES_HOST was set, because no caller set the flag.
+    """
+    env = {"POSTGRES_HOST": "fake-host"}
+    with patch.dict(os.environ, env, clear=False):
+        os.environ.pop("USE_POSTGRESQL", None)
+        mgr = DatabaseManager(host="fake-host", port=5432)
+    assert mgr.enabled is True
+    assert mgr.port == 5432
+
+
+def test_init_use_postgresql_false_explicit_opt_out():
+    """Setting USE_POSTGRESQL=false still disables the client."""
+    env = {"POSTGRES_HOST": "fake-host", "USE_POSTGRESQL": "false"}
+    with patch.dict(os.environ, env, clear=False):
+        mgr = DatabaseManager(host="fake-host", port=5432)
+    assert mgr.enabled is False
     assert mgr.port == 5432

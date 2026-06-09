@@ -70,7 +70,7 @@ rows = await db.fetch("SELECT id, name FROM users WHERE active = $1", True)
 - `POSTGRES_SSL_NO_VERIFY` — `true` to skip cert verification
 - `POSTGRES_APP_NAME` — default `devnexus-common`
 - `POSTGRES_SEARCH_PATH` — default `public`
-- `USE_POSTGRESQL` — must be `true` to enable the client
+- `USE_POSTGRESQL` — default `true`; set to `false` to disable the client (skip connection on `connect()` and raise on `ensure_connected()`)
 
 ### `common.a2a.client` — A2A HTTP client
 
