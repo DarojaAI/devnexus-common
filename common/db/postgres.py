@@ -45,8 +45,12 @@ class DatabaseManager:
             search_path: Schema search path (defaults to POSTGRES_SEARCH_PATH env var).
         """
         self.host = (host or os.getenv("POSTGRES_HOST", "localhost")).strip()
-        port_str = (port or os.getenv("POSTGRES_PORT") or "5432")
-        self.port = int(port_str.strip()) if port_str and port_str.strip() else 5432
+        # port is typed `Optional[int]`; coerce str→int so callers can pass either.
+        # The previous `port_str.strip()` raised AttributeError on int input.
+        if port is not None:
+            self.port = int(port)
+        else:
+            self.port = int(os.getenv("POSTGRES_PORT", "5432"))
         self.database = (database or os.getenv("POSTGRES_DB", "devnexus")).strip()
         self.user = (user or os.getenv("POSTGRES_USER", "devnexus")).strip()
         self.password = password or os.getenv("POSTGRES_PASSWORD", "")

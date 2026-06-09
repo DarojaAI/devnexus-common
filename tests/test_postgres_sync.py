@@ -12,6 +12,7 @@ No real postgres required — asyncpg is mocked at the .pool level.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -377,3 +378,48 @@ def test_close_db_sync_closes_when_pool_present():
     with patch.object(pg_module, "_db_manager", mgr):
         pg_module.close_db_sync()
         mgr._run_sync.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# __init__ port handling — regression for 'int' object has no attribute 'strip'
+# ---------------------------------------------------------------------------
+# The constructor's type hint is `port: Optional[int]`, but the previous
+# implementation did `port_str.strip()` which raised AttributeError when a
+# caller passed an int (the natural Python type). This was first noticed
+# when rag_research_tool's wiki server, after migrating to the sync facade,
+# hit `Connection failed: 'int' object has no attribute 'strip'` in /health.
+
+
+def test_init_accepts_int_port():
+    """port=5432 (int) must not raise; the natural Python type for a port."""
+    env = {"POSTGRES_HOST": "fake-host", "USE_POSTGRESQL": "false"}
+    with patch.dict(os.environ, env, clear=False):
+        mgr = DatabaseManager(host="fake-host", port=5432)
+    assert mgr.port == 5432
+    assert isinstance(mgr.port, int)
+
+
+def test_init_accepts_str_port():
+    """port='5432' (str, e.g. from os.environ) must be coerced to int."""
+    env = {"POSTGRES_HOST": "fake-host", "USE_POSTGRESQL": "false"}
+    with patch.dict(os.environ, env, clear=False):
+        mgr = DatabaseManager(host="fake-host", port="5432")
+    assert mgr.port == 5432
+    assert isinstance(mgr.port, int)
+
+
+def test_init_port_none_uses_env_var():
+    """port=None falls back to POSTGRES_PORT env var."""
+    env = {"POSTGRES_HOST": "fake-host", "POSTGRES_PORT": "6432", "USE_POSTGRESQL": "false"}
+    with patch.dict(os.environ, env, clear=False):
+        mgr = DatabaseManager(host="fake-host", port=None)
+    assert mgr.port == 6432
+
+
+def test_init_port_none_default_when_env_unset():
+    """port=None with POSTGRES_PORT unset uses the 5432 default."""
+    env = {"POSTGRES_HOST": "fake-host", "USE_POSTGRESQL": "false"}
+    with patch.dict(os.environ, env, clear=False):
+        os.environ.pop("POSTGRES_PORT", None)
+        mgr = DatabaseManager(host="fake-host", port=None)
+    assert mgr.port == 5432
