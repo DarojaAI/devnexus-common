@@ -61,9 +61,15 @@ class DatabaseManager:
         if not self.host or self.host == "localhost":
             raise ValueError(f"POSTGRES_HOST is not configured: {self.host}")
 
-        # Production-aware pool sizing
+        # Pool sizing: keep at least 2 connections warm to avoid cold-start
+        # races when multiple Cloud Run / FastAPI requests hit the facade
+        # concurrently. The previous default of min=0 in non-prod envs caused
+        # "another operation is in progress" / "pool is closed" failures
+        # on the first burst of requests after a cold start or a stale-pool
+        # reconnect. Callers who genuinely want lazy connect can pass
+        # min_size=0 explicitly.
         env = os.getenv("ENVIRONMENT", "dev").lower()
-        self.min_size = min_size or (2 if env == "prod" else 0)
+        self.min_size = min_size if min_size is not None else 2
         self.max_size = max_size or (10 if env == "prod" else 5)
         self.pool: Optional[asyncpg.Pool] = None
 
@@ -232,14 +238,26 @@ class DatabaseManager:
             await self.connect()
             return
 
-        # Liveness probe: detect stale pool where all connections are dead
-        try:
-            async with self.pool.acquire(timeout=2) as conn:
-                await conn.execute("SELECT 1")
-        except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError, asyncio.TimeoutError) as e:
-            logger.warning(f"DB pool stale — forcing reconnect: {e}")
-            await self.disconnect()
-            await self.connect()
+        # Liveness probe with retry-after-reconnect: detect a stale pool where
+        # connections died mid-operation (e.g. PG server restart, or a
+        # concurrent request closed a connection we were about to use). If
+        # the probe fails, force a reconnect, then re-probe the *new* pool
+        # before returning. Without the re-probe, the caller's next
+        # operation can hit a half-state pool and fail with
+        # "cannot perform operation: another operation is in progress" or
+        # "pool is closed" — the symptoms we hit in production on
+        # rag_research_tool's wiki /health vs /db-status.
+        for attempt in range(2):
+            try:
+                async with self.pool.acquire(timeout=2) as conn:
+                    await conn.execute("SELECT 1")
+                return
+            except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError, asyncio.TimeoutError) as e:
+                if attempt == 1:
+                    raise
+                logger.warning(f"DB pool stale — forcing reconnect: {e}")
+                await self.disconnect()
+                await self.connect()
 
     async def _with_retry(self, coro_factory, max_retries: int = 2):
         """Execute coroutine with transient error retry."""
