@@ -16,6 +16,8 @@ import os
 from typing import Any, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg.exceptions
+
 import pytest
 
 from common.db.postgres import DatabaseManager
@@ -448,3 +450,77 @@ def test_init_use_postgresql_false_explicit_opt_out():
         mgr = DatabaseManager(host="fake-host", port=5432)
     assert mgr.enabled is False
     assert mgr.port == 5432
+
+
+def test_init_default_min_pool_size_is_2():
+    """min_size defaults to 2 to avoid cold-start races on the first burst.
+
+    The previous default of min=0 in non-prod envs left the pool empty at
+    startup, so concurrent requests fought for the first connection —
+    "another operation is in progress" / "pool is closed" errors.
+    """
+    env = {"POSTGRES_HOST": "fake-host"}
+    with patch.dict(os.environ, env, clear=False):
+        mgr = DatabaseManager(host="fake-host", port=5432)
+    assert mgr.min_size == 2
+
+
+def test_init_min_pool_size_explicit_zero_still_honored():
+    """Callers who genuinely want lazy connect can pass min_size=0."""
+    env = {"POSTGRES_HOST": "fake-host"}
+    with patch.dict(os.environ, env, clear=False):
+        mgr = DatabaseManager(host="fake-host", port=5432, min_size=0)
+    assert mgr.min_size == 0
+
+
+@pytest.mark.asyncio
+
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_retries_liveness_probe_after_reconnect():
+    """If the first liveness probe fails, ensure_connected reconnects and
+    re-probes the *new* pool before returning. Without the re-probe, the
+    caller's next operation can hit a half-state pool and fail.
+
+    Regression: rag_research_tool's wiki /health vs /db-status showed
+    inconsistent results — /db-status succeeded (probe had settled by
+    then), /health failed (probe was racing with a concurrent request).
+    """
+    mgr = _make_manager_with_mock_pool()
+
+    # Mock the pool: first acquire() raises ConnectionDoesNotExistError,
+    # second one (after reconnect) succeeds.
+    call_count = [0]
+
+    class _FakeConn:
+        async def execute(self, q, *a):
+            return None
+
+    class _FakeAcquire:
+        def __init__(self, should_fail):
+            self.should_fail = should_fail
+        async def __aenter__(self):
+            call_count[0] += 1
+            if self.should_fail:
+                raise asyncpg.exceptions.ConnectionDoesNotExistError("simulated stale")
+            return _FakeConn()
+        async def __aexit__(self, *a):
+            return None
+
+    def _acquire_factory(*a, **kw):
+        # First call fails, subsequent calls succeed
+        return _FakeAcquire(should_fail=(call_count[0] == 0))
+
+    mgr.pool = MagicMock()
+    mgr.pool.acquire = MagicMock(side_effect=_acquire_factory)
+    mgr.disconnect = AsyncMock()
+    mgr.connect = AsyncMock()
+
+    await mgr.ensure_connected()
+
+    # Probe ran twice (first failed, second succeeded after reconnect)
+    assert call_count[0] == 2
+    # disconnect + connect each called once (the reconnect path)
+    mgr.disconnect.assert_awaited_once()
+    mgr.connect.assert_awaited_once()
