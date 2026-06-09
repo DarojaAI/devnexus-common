@@ -72,7 +72,12 @@ class DatabaseManager:
         self._connection_error: Optional[str] = None
 
         # Check if PostgreSQL should be used
-        self.enabled = os.getenv("USE_POSTGRESQL", "false").lower() == "true"
+        # Default to enabled: the facade exists to provide PG access; callers
+        # who need to opt out set USE_POSTGRESQL=false explicitly. The previous
+        # default of "false" silently disabled every downstream that didn't
+        # remember to set the flag — first caught when rag_research_tool's
+        # wiki /db-status returned "PostgreSQL is disabled" after migrate.
+        self.enabled = os.getenv("USE_POSTGRESQL", "true").lower() == "true"
 
         self._application_name = (application_name or os.getenv("POSTGRES_APP_NAME", "devnexus-common")).strip()
         self._search_path = (search_path or os.getenv("POSTGRES_SEARCH_PATH", "public")).strip()
