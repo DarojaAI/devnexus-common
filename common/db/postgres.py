@@ -5,15 +5,73 @@ No VPC connector logic — just standard TCP to the provided host.
 """
 
 import os
+import time
 import asyncpg
 import logging
 import asyncio
 import ssl
+from collections import deque
 from typing import Optional, List, Dict, Any, Tuple
 import threading
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
+
+
+class _PoolStats:
+    """In-memory pool saturation metrics for observability (issue #687).
+
+    Tracks acquire counts, wait times, and failures so callers can
+    detect pool starvation before it manifests as user-visible slowness.
+    The samples ring buffer is bounded to keep memory predictable in
+    long-running processes.
+    """
+
+    # Number of recent wait-time samples kept for percentile estimation.
+    # 1024 is enough for stable p99 over 5-minute windows at typical
+    # QPS without unbounded growth.
+    _SAMPLE_CAP = 1024
+
+    def __init__(self) -> None:
+        self.acquire_total: int = 0
+        self.acquire_failed_total: int = 0
+        self.acquire_wait_ms_total: float = 0.0
+        # Bounded ring buffer of recent wait times (ms) for percentile
+        # estimation. deque(maxlen=...) is O(1) append and discards old
+        # entries automatically.
+        self.recent_wait_ms: deque = deque(maxlen=self._SAMPLE_CAP)
+
+    def record_acquire(self, wait_ms: float) -> None:
+        self.acquire_total += 1
+        self.acquire_wait_ms_total += wait_ms
+        self.recent_wait_ms.append(wait_ms)
+
+    def record_acquire_failure(self) -> None:
+        self.acquire_failed_total += 1
+
+    def summary(self) -> Dict[str, Any]:
+        """Return a JSON-serializable summary suitable for health-check output."""
+        waits = sorted(self.recent_wait_ms) if self.recent_wait_ms else []
+        n = len(waits)
+        if n == 0:
+            p50 = p95 = p99 = 0.0
+        else:
+            p50 = waits[max(0, int(n * 0.50) - 1)]
+            p95 = waits[max(0, int(n * 0.95) - 1)]
+            p99 = waits[max(0, int(n * 0.99) - 1)]
+        return {
+            "acquire_total": self.acquire_total,
+            "acquire_failed_total": self.acquire_failed_total,
+            "acquire_wait_ms_avg": (
+                self.acquire_wait_ms_total / self.acquire_total
+                if self.acquire_total
+                else 0.0
+            ),
+            "acquire_wait_ms_p50": p50,
+            "acquire_wait_ms_p95": p95,
+            "acquire_wait_ms_p99": p99,
+            "sample_count": n,
+        }
 
 
 class DatabaseManager:
@@ -84,6 +142,13 @@ class DatabaseManager:
         self._connection_state = "disconnected"
         self._connection_error: Optional[str] = None
 
+        # Pool saturation metrics (issue #687). Acquire wait times and
+        # failure counts are accumulated here and exposed via
+        # health_check() so the operator sees pool starvation before it
+        # becomes user-visible. The data is per-process (not global);
+        # multiple DatabaseManager instances have independent counters.
+        self._stats = _PoolStats()
+
         # Check if PostgreSQL should be used
         # Default to enabled: the facade exists to provide PG access; callers
         # who need to opt out set USE_POSTGRESQL=false explicitly. The previous
@@ -98,6 +163,17 @@ class DatabaseManager:
         self._search_path = (
             search_path or os.getenv("POSTGRES_SEARCH_PATH", "public")
         ).strip()
+
+        # Statement timeout (ms) — applied as a session setting (statement_timeout)
+        # AND as asyncpg's per-operation command_timeout (seconds). Both
+        # bound the runtime of any single query. The value is
+        # POSTGRES_STATEMENT_TIMEOUT_MS (default 30000 = 30s), tunable
+        # per-tool for batch jobs that legitimately need longer. Issue #686.
+        # Stored as int ms internally; converted to float seconds for
+        # command_timeout at call time.
+        self.statement_timeout_ms = int(
+            os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", "30000")
+        )
 
         # Dedicated event loop for the sync facade (issues #7/#9).
         # asyncpg's pool is bound to whichever loop is running when the pool
@@ -183,13 +259,13 @@ class DatabaseManager:
                             ssl=ssl_arg,
                             min_size=self.min_size,
                             max_size=self.max_size,
-                            command_timeout=30,
+                            command_timeout=self.statement_timeout_ms / 1000.0,
                             max_inactive_connection_lifetime=300,
                             max_queries=1000,
                             server_settings={
                                 "application_name": self._application_name,
                                 "search_path": self._search_path,
-                                "statement_timeout": "30000",
+                                "statement_timeout": str(self.statement_timeout_ms),
                             },
                         ),
                         timeout=10,
@@ -216,13 +292,15 @@ class DatabaseManager:
                                     ssl=False,
                                     min_size=self.min_size,
                                     max_size=self.max_size,
-                                    command_timeout=30,
+                                    command_timeout=self.statement_timeout_ms / 1000.0,
                                     max_inactive_connection_lifetime=300,
                                     max_queries=1000,
                                     server_settings={
                                         "application_name": self._application_name,
                                         "search_path": self._search_path,
-                                        "statement_timeout": "30000",
+                                        "statement_timeout": str(
+                                            self.statement_timeout_ms
+                                        ),
                                     },
                                 ),
                                 timeout=10,
@@ -355,12 +433,34 @@ class DatabaseManager:
 
     @asynccontextmanager
     async def acquire(self):
-        """Context manager for acquiring a connection from pool."""
+        """Context manager for acquiring a connection from pool.
+
+        Times the pool acquire wait and records it (and any failure) on
+        the _PoolStats for issue #687 observability. The timing covers
+        ONLY the time spent waiting for a connection in the pool's
+        internal queue -- not the time the user code holds the
+        connection.
+        """
         if not self.enabled or self.pool is None:
             raise RuntimeError("Database not connected")
 
-        async with self.pool.acquire() as connection:
+        start = time.monotonic()
+        failed = True
+        try:
+            pool_ctx = self.pool.acquire()
+            connection = await pool_ctx.__aenter__()
+            failed = False
+        finally:
+            wait_ms = (time.monotonic() - start) * 1000.0
+            if failed:
+                self._stats.record_acquire_failure()
+            else:
+                self._stats.record_acquire(wait_ms)
+
+        try:
             yield connection
+        finally:
+            await pool_ctx.__aexit__(None, None, None)
 
     async def health_check(self) -> Dict[str, Any]:
         """Check database health."""
@@ -382,11 +482,16 @@ class DatabaseManager:
                     "min": self.pool.get_min_size(),
                     "max": self.pool.get_max_size(),
                 }
+                # Merge the live pool stats (size/free/min/max from
+                # asyncpg) with the accumulated saturation metrics from
+                # _PoolStats (issue #687). The operator sees both at a
+                # glance: live state + pressure over time.
+                saturation = self._stats.summary()
                 return {
                     "status": "healthy",
                     "version": version.split(",")[0],
                     "pgvector_version": pgvector["extversion"] if pgvector else None,
-                    "pool": pool_stats,
+                    "pool": {**pool_stats, **saturation},
                     "host": self.host,
                     "database": self.database,
                 }

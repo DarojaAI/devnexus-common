@@ -71,6 +71,36 @@ rows = await db.fetch("SELECT id, name FROM users WHERE active = $1", True)
 - `POSTGRES_APP_NAME` — default `devnexus-common`
 - `POSTGRES_SEARCH_PATH` — default `public`
 - `USE_POSTGRESQL` — default `true`; set to `false` to disable the client (skip connection on `connect()` and raise on `ensure_connected()`)
+- `POSTGRES_STATEMENT_TIMEOUT_MS` — default `30000` (30s). Applied centrally as a `statement_timeout` server setting on every acquired session so a single runaway query cannot starve the shared pool (issue #686).
+
+**Session-level settings (applied on every `pool.acquire()`):**
+- `statement_timeout` = 30s by default. Configurable via the env var above. asyncpg's `command_timeout` is also set to 30s. The server-side timeout is the primary defense; asyncpg's client-side is a backup.
+
+**Pool saturation observability (issue #687):**
+`DatabaseManager` accumulates in-memory metrics on every acquire:
+- `acquire_total` (counter)
+- `acquire_failed_total` (counter)
+- `acquire_wait_ms_avg` / `_p50` / `_p95` / `_p99` (over a bounded ring buffer of the last 1024 wait times)
+
+Exposed via `health_check()` under the `pool` sub-dict, alongside the existing live `size`/`free`/`min`/`max` stats. The `health_check_sync()` wrapper is available for sync callers. Example:
+
+```python
+db = DatabaseManager()
+await db.connect()
+result = await db.health_check()
+# result["pool"] == {
+#   "size": 1, "free": 1, "min": 0, "max": 5,
+#   "acquire_total": 142, "acquire_failed_total": 0,
+#   "acquire_wait_ms_avg": 1.2, "acquire_wait_ms_p50": 0.4,
+#   "acquire_wait_ms_p95": 3.7, "acquire_wait_ms_p99": 12.1,
+#   "sample_count": 142,
+# }
+```
+
+Wire the `_p99` field to your alerting (recommended threshold: > 1s for 5m
+sustained). Run the `test_pool_saturation.py` stress test before rolling
+out a new downstream consumer to make sure your workload doesn't trip
+the alert under normal traffic.
 
 ### `common.a2a.client` — A2A HTTP client
 
