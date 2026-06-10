@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      skip-dirty-check:
+        description: 'Skip uncommitted changes check'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: semantic-release-${{ github.repository }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  semantic-release:
+    name: Semantic Release
+    if: "!contains(github.event.head_commit.message, '[skip release]')"
+    uses: DarojaAI/infra-actions/.github/workflows/reusable-semantic-release.yml@v1.3.0
+    with:
+      working-directory: '.'
+      skip-dirty-check: ${{ inputs.skip-dirty-check || 'true' }}
+    secrets:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
