@@ -12,15 +12,13 @@ Usage:
     python compliance/audit.py --watch                   # Watch for changes
 """
 
-import os
 import sys
 import json
 import yaml
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, Any
 from datetime import datetime
-import subprocess
 import re
 
 
@@ -33,7 +31,7 @@ class ComplianceAudit:
         self.results: Dict[str, Any] = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "repositories": {},
-            "cross_repository": {}
+            "cross_repository": {},
         }
 
     def _load_config(self) -> Dict:
@@ -43,7 +41,7 @@ class ComplianceAudit:
             return {}
 
         try:
-            with open(self.config_path, 'r') as f:
+            with open(self.config_path, "r") as f:
                 return yaml.safe_load(f) or {}
         except Exception as e:
             print(f"[ERROR] Failed to load config: {e}")
@@ -57,7 +55,7 @@ class ComplianceAudit:
             return {
                 "status": "ERROR",
                 "error": f"Repository not found: {repo_path}",
-                "standards": {}
+                "standards": {},
             }
 
         standards_to_check = self._get_standards_for_type(repo_type)
@@ -83,7 +81,7 @@ class ComplianceAudit:
             "passed": passed,
             "failed": failed,
             "warned": warned,
-            "standards": standards_results
+            "standards": standards_results,
         }
 
     def _get_standards_for_type(self, repo_type: str) -> Dict[str, Any]:
@@ -96,7 +94,9 @@ class ComplianceAudit:
 
         return standards
 
-    def _check_standard(self, repo_root: Path, standard: Dict[str, Any]) -> Dict[str, Any]:
+    def _check_standard(
+        self, repo_root: Path, standard: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Check if a standard is met"""
         standard_id = standard.get("id", "unknown")
         level = standard.get("level", "optional")
@@ -116,12 +116,14 @@ class ComplianceAudit:
                 # Specific file
                 exists = (repo_root / path_pattern).exists()
 
-            file_checks.append({
-                "path": path_pattern,
-                "exists": exists,
-                "required": required,
-                "description": description
-            })
+            file_checks.append(
+                {
+                    "path": path_pattern,
+                    "exists": exists,
+                    "required": required,
+                    "description": description,
+                }
+            )
 
         # Check content
         content_checks = []
@@ -133,28 +135,32 @@ class ComplianceAudit:
             file_full_path = repo_root / file_path
 
             if not file_full_path.exists():
-                content_checks.append({
-                    "file": file_path,
-                    "pattern": pattern,
-                    "found": False,
-                    "description": description,
-                    "reason": "File not found"
-                })
+                content_checks.append(
+                    {
+                        "file": file_path,
+                        "pattern": pattern,
+                        "found": False,
+                        "description": description,
+                        "reason": "File not found",
+                    }
+                )
                 continue
 
             try:
-                content = file_full_path.read_text(encoding='utf-8', errors='ignore')
-            except:
-                content = file_full_path.read_text(encoding='latin-1', errors='ignore')
+                content = file_full_path.read_text(encoding="utf-8", errors="ignore")
+            except UnicodeDecodeError:
+                content = file_full_path.read_text(encoding="latin-1", errors="ignore")
 
             found = re.search(pattern, content) is not None
 
-            content_checks.append({
-                "file": file_path,
-                "pattern": pattern,
-                "found": found,
-                "description": description
-            })
+            content_checks.append(
+                {
+                    "file": file_path,
+                    "pattern": pattern,
+                    "found": found,
+                    "description": description,
+                }
+            )
 
         # Determine status
         file_failures = [c for c in file_checks if not c["exists"] and c["required"]]
@@ -173,7 +179,7 @@ class ComplianceAudit:
             "description": standard.get("description", ""),
             "file_checks": file_checks,
             "content_checks": content_checks,
-            "failures": file_failures + content_failures
+            "failures": file_failures + content_failures,
         }
 
     def audit_backend(self, repo_path: str) -> Dict[str, Any]:
@@ -210,7 +216,9 @@ class ComplianceAudit:
             lines.append(f"Status: {status} | Score: {score}")
             lines.append("")
 
-            for standard_id, standard_result in repo_result.get("standards", {}).items():
+            for standard_id, standard_result in repo_result.get(
+                "standards", {}
+            ).items():
                 status = standard_result.get("status", "UNKNOWN")
                 title = standard_result.get("title", standard_id)
                 level = standard_result.get("level", "")
@@ -272,7 +280,9 @@ class ComplianceAudit:
         <ul>
 """
 
-            for standard_id, standard_result in repo_result.get("standards", {}).items():
+            for standard_id, standard_result in repo_result.get(
+                "standards", {}
+            ).items():
                 status = standard_result.get("status", "").lower()
                 title = standard_result.get("title", standard_id)
                 level = standard_result.get("level", "")
@@ -309,7 +319,7 @@ class ComplianceAudit:
 
         html = html.format(timestamp=self.results["timestamp"])
 
-        with open(output_path, 'w') as f:
+        with open(output_path, "w") as f:
             f.write(html)
 
         return output_path
@@ -321,11 +331,21 @@ def main():
     )
     parser.add_argument("--backend", "-b", help="Backend repository path")
     parser.add_argument("--frontend", "-f", help="Frontend repository path")
-    parser.add_argument("--all", "-a", action="store_true", help="Audit all configured repos")
-    parser.add_argument("--config", "-c", default="compliance/standards-config.yaml",
-                        help="Configuration file")
-    parser.add_argument("--format", choices=["text", "json", "html"], default="text",
-                        help="Report format")
+    parser.add_argument(
+        "--all", "-a", action="store_true", help="Audit all configured repos"
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        default="compliance/standards-config.yaml",
+        help="Configuration file",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["text", "json", "html"],
+        default="text",
+        help="Report format",
+    )
     parser.add_argument("--report", "-r", help="Report output file (for json/html)")
     parser.add_argument("--watch", "-w", action="store_true", help="Watch for changes")
 
@@ -348,7 +368,7 @@ def main():
     if args.format == "json":
         report = audit.generate_json_report()
         if args.report:
-            with open(args.report, 'w') as f:
+            with open(args.report, "w") as f:
                 f.write(report)
             print(f"[OK] Report saved to {args.report}")
         else:
@@ -362,7 +382,7 @@ def main():
     else:  # text
         report = audit.generate_text_report()
         if args.report:
-            with open(args.report, 'w') as f:
+            with open(args.report, "w") as f:
                 f.write(report)
             print(f"[OK] Report saved to {args.report}")
         else:
