@@ -15,6 +15,7 @@ import asyncio
 import os
 from typing import Any, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
+import threading
 
 import asyncpg.exceptions
 
@@ -52,6 +53,20 @@ def _make_manager_with_mock_pool(
     mgr.password = "fake-pass"
     mgr._application_name = "test"
     mgr._search_path = "public"
+
+    # Issue #7: cancellation-safety state (set by _with_retry on CancelledError,
+    # consumed by ensure_connected).
+    mgr._needs_pool_reset = False
+
+    # Issues #7/#9: dedicated event loop state (set by _ensure_loop, used by
+    # _run_sync). The test helper sets them to None so _ensure_loop knows
+    # to start a fresh daemon thread if a test calls it.
+    mgr._loop = None
+    mgr._loop_thread = None
+    mgr._loop_lock = threading.Lock()
+    mgr._loop_started = threading.Event()
+    mgr._loop_failed = None
+
     return mgr
 
 
@@ -537,4 +552,169 @@ async def test_with_retry_does_not_disconnect_on_transient_error():
     assert call_count[0] == 2
     # CRITICAL: disconnect and connect must NOT have been called
     mgr.disconnect.assert_not_awaited()
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #7: cancellation safety
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_with_retry_marks_pool_for_reset_on_cancellation():
+    """When the in-flight coro is cancelled, _with_retry sets
+    _needs_pool_reset = True and re-raises CancelledError unchanged.
+
+    This is the load-bearing assertion for issue #7: the flag is the
+    handoff that lets the next non-cancelled ensure_connected() rebuild
+    the pool cleanly, instead of us disconnecting mid-cancellation (which
+    is the original segfault pattern).
+    """
+    mgr = _make_manager_with_mock_pool()
+    assert mgr._needs_pool_reset is False
+
+    async def _cancelled_coro():
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await mgr._with_retry(_cancelled_coro)
+
+    assert mgr._needs_pool_reset is True, (
+        "CancelledError must flag the pool for deferred reset "
+        "(see issue #7 / production SIGSEGV root cause)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_resets_pool_when_flag_set():
+    """If _needs_pool_reset is True and pool is alive, ensure_connected
+    disconnects cleanly and reconnects, then clears the flag.
+
+    The disconnect happens in a non-racing context (no CancelledError
+    in flight), which is what makes this pattern safe.
+    """
+    mgr = _make_manager_with_mock_pool()
+    mgr._needs_pool_reset = True
+    old_pool = MagicMock(name="old_pool")
+    mgr.pool = old_pool
+    mgr.disconnect = AsyncMock()
+    mgr.connect = AsyncMock()
+
+    await mgr.ensure_connected()
+
+    mgr.disconnect.assert_awaited_once()
+    mgr.connect.assert_awaited_once()
+    assert mgr._needs_pool_reset is False, "reset flag must be consumed"
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_no_reset_when_flag_unset():
+    """Regression check: when _needs_pool_reset is False (the normal
+    case), ensure_connected does NOT call disconnect. We rely on
+    asyncpg's natural pool-dead-connection handling; calling disconnect
+    on every call would be expensive and would re-introduce the
+    segfault pattern (issue #7).
+    """
+    mgr = _make_manager_with_mock_pool()
+    assert mgr._needs_pool_reset is False
+    # pool is non-None so ensure_connected takes the "already connected" path
+    mgr.pool = MagicMock(name="healthy_pool")
+    mgr.disconnect = AsyncMock()
+    mgr.connect = AsyncMock()
+
+    await mgr.ensure_connected()
+
+    mgr.disconnect.assert_not_awaited()
     mgr.connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_resets_flag_even_if_disconnect_fails():
+    """If disconnect() raises during the reset path, ensure_connected
+    must still clear the flag and proceed (set pool to None, fall
+    through to reconnect). Otherwise the flag stays set forever and
+    every subsequent call tries (and fails) to reset."""
+    mgr = _make_manager_with_mock_pool()
+    mgr._needs_pool_reset = True
+    mgr.pool = MagicMock(name="old_pool")
+    mgr.disconnect = AsyncMock(side_effect=RuntimeError("disconnect failed"))
+    mgr.connect = AsyncMock()
+
+    await mgr.ensure_connected()
+
+    assert mgr._needs_pool_reset is False
+    mgr.connect.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Issues #7/#9: dedicated event loop in _run_sync
+# ---------------------------------------------------------------------------
+
+
+def test_run_sync_uses_dedicated_loop_not_per_call_asyncio_run():
+    """Two _run_sync calls in a row must share the same loop. The whole
+    point of the refactor is to bind the asyncpg pool to one stable loop
+    for the lifetime of the DatabaseManager; a fresh loop per call would
+    re-introduce the segfault (issue #7/#9)."""
+    mgr = _make_manager_with_mock_pool()
+
+    async def _coro():
+        return 1
+
+    mgr._run_sync(_coro())
+    first_loop = mgr._loop
+    first_thread = mgr._loop_thread
+    assert first_loop is not None
+    assert first_thread is not None
+    assert first_thread.daemon is True, "loop thread must be daemon"
+    assert first_thread.is_alive()
+
+    mgr._run_sync(_coro())
+    assert mgr._loop is first_loop, "second call must reuse the same loop"
+    assert mgr._loop_thread is first_thread, "second call must reuse the same thread"
+
+
+def test_ensure_loop_returns_same_loop_for_concurrent_threads():
+    """Thread-safety: two threads racing on _ensure_loop() must both
+    get the same loop (not start two threads). The lock serializes
+    the start sequence."""
+    mgr = _make_manager_with_mock_pool()
+    loops: list = []
+
+    def _worker():
+        loop = mgr._ensure_loop()
+        loops.append(loop)
+
+    t1 = threading.Thread(target=_worker)
+    t2 = threading.Thread(target=_worker)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert len(loops) == 2
+    assert loops[0] is loops[1], "both threads must observe the same loop"
+    assert mgr._loop is not None
+    assert mgr._loop_thread is not None
+
+
+def test_run_sync_propagates_cancelled_error_from_coro():
+    """If the coroutine itself raises CancelledError, _run_sync re-raises
+    it as-is. This is the cancellation contract: the caller knows the
+    op was cancelled and can react. Combined with _with_retry's flag-set
+    behavior, this is what makes the whole pipeline work."""
+    mgr = _make_manager_with_mock_pool()
+
+    async def _cancelled():
+        raise asyncio.CancelledError()
+
+    # concurrent.futures.Future.result() re-raises asyncio.CancelledError
+    # as concurrent.futures.CancelledError (different class, NOT a subclass
+    # of asyncio.CancelledError as of Python 3.10). The cancellation
+    # contract from the caller's perspective is "a CancelledError-family
+    # exception was raised" — accept either class.
+    import concurrent.futures
+    with pytest.raises((asyncio.CancelledError, concurrent.futures.CancelledError)):
+        mgr._run_sync(_cancelled())
+
+    assert mgr._loop is not None, "loop must be initialized even on cancellation"
