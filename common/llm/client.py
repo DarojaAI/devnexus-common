@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Message:
     """Message wrapper for compatibility across providers"""
+
     role: str  # "user", "assistant"
     content: str
 
@@ -38,6 +39,7 @@ class Message:
 @dataclass
 class LLMResponse:
     """Response wrapper for compatibility across providers"""
+
     content: str
     model: str
     stop_reason: Optional[str] = None
@@ -54,7 +56,7 @@ class LLMClient(ABC):
         messages: List[Dict[str, str]],
         max_tokens: int = 4096,
         temperature: float = 0.7,
-        **kwargs
+        **kwargs,
     ) -> LLMResponse:
         """Create a message using the LLM"""
         pass
@@ -88,7 +90,7 @@ class AnthropicClient(LLMClient):
         messages: List[Dict[str, str]],
         max_tokens: int = 4096,
         temperature: float = 0.7,
-        **kwargs
+        **kwargs,
     ) -> LLMResponse:
         """Create a message via Anthropic API"""
         try:
@@ -97,22 +99,28 @@ class AnthropicClient(LLMClient):
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                **kwargs
+                **kwargs,
             )
 
             # Extract content from response
             content = ""
             if response.content:
-                content = response.content[0].text if hasattr(response.content[0], 'text') else str(response.content[0])
+                content = (
+                    response.content[0].text
+                    if hasattr(response.content[0], "text")
+                    else str(response.content[0])
+                )
 
             return LLMResponse(
                 content=content,
                 model=response.model,
-                stop_reason=getattr(response, 'stop_reason', None),
+                stop_reason=getattr(response, "stop_reason", None),
                 usage={
                     "input_tokens": response.usage.input_tokens,
                     "output_tokens": response.usage.output_tokens,
-                } if response.usage else None
+                }
+                if response.usage
+                else None,
             )
         except Exception as e:
             logger.error(f"Anthropic API error: {e}")
@@ -128,7 +136,7 @@ class OpenRouterClient(LLMClient):
     def __init__(self, api_key: str):
         """Initialize OpenRouter client"""
         try:
-            import requests
+            import requests  # noqa: F401
         except ImportError:
             raise ImportError("requests package required: pip install requests")
 
@@ -145,7 +153,7 @@ class OpenRouterClient(LLMClient):
         messages: List[Dict[str, str]],
         max_tokens: int = 4096,
         temperature: float = 0.7,
-        **kwargs
+        **kwargs,
     ) -> LLMResponse:
         """Create a message via OpenRouter API"""
         import requests
@@ -165,7 +173,7 @@ class OpenRouterClient(LLMClient):
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            **kwargs
+            **kwargs,
         }
 
         try:
@@ -173,7 +181,7 @@ class OpenRouterClient(LLMClient):
                 f"{self.base_url}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=60
+                timeout=60,
             )
             response.raise_for_status()
 
@@ -187,15 +195,19 @@ class OpenRouterClient(LLMClient):
             return LLMResponse(
                 content=content,
                 model=data.get("model", model),
-                stop_reason=data["choices"][0].get("finish_reason") if data.get("choices") else None,
+                stop_reason=data["choices"][0].get("finish_reason")
+                if data.get("choices")
+                else None,
                 usage={
                     "input_tokens": data.get("usage", {}).get("prompt_tokens", 0),
                     "output_tokens": data.get("usage", {}).get("completion_tokens", 0),
-                } if data.get("usage") else None
+                }
+                if data.get("usage")
+                else None,
             )
         except requests.exceptions.RequestException as e:
             logger.error(f"OpenRouter API error: {e}")
-            if hasattr(e, 'response') and e.response is not None:
+            if hasattr(e, "response") and e.response is not None:
                 logger.error(f"Response: {e.response.text}")
             raise
 
@@ -251,18 +263,18 @@ def get_llm_client_from_config(config: Any) -> LLMClient:
     Returns:
         LLMClient instance
     """
-    provider = getattr(config, 'llm_provider', 'anthropic').lower()
+    provider = getattr(config, "llm_provider", "anthropic").lower()
 
     if provider == "anthropic":
-        api_key = getattr(config, 'anthropic_api_key', '')
+        api_key = getattr(config, "anthropic_api_key", "")
         if not api_key:
-            api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         return get_llm_client("anthropic", api_key)
 
     elif provider == "openrouter":
-        api_key = getattr(config, 'openrouter_api_key', '')
+        api_key = getattr(config, "openrouter_api_key", "")
         if not api_key:
-            api_key = os.environ.get('OPENROUTER_API_KEY', '')
+            api_key = os.environ.get("OPENROUTER_API_KEY", "")
         return get_llm_client("openrouter", api_key)
 
     else:

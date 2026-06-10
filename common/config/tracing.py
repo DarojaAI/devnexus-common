@@ -28,6 +28,7 @@ def _is_langfuse_available() -> bool:
     """Check if the langfuse module is importable."""
     try:
         import langfuse  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -146,7 +147,6 @@ def log_llm_call(
 
     if _langsmith_enabled:
         try:
-            import langsmith
             from langsmith.run_trees import RunTree
 
             run_tree = RunTree(

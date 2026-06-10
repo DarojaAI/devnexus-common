@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, List, Optional, Tuple
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 import threading
 
@@ -554,7 +554,6 @@ async def test_with_retry_does_not_disconnect_on_transient_error():
     mgr.disconnect.assert_not_awaited()
 
 
-
 # ---------------------------------------------------------------------------
 # Issue #7: cancellation safety
 # ---------------------------------------------------------------------------
@@ -714,6 +713,7 @@ def test_run_sync_propagates_cancelled_error_from_coro():
     # contract from the caller's perspective is "a CancelledError-family
     # exception was raised" — accept either class.
     import concurrent.futures
+
     with pytest.raises((asyncio.CancelledError, concurrent.futures.CancelledError)):
         mgr._run_sync(_cancelled())
 
