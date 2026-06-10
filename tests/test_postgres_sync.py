@@ -452,14 +452,23 @@ def test_init_use_postgresql_false_explicit_opt_out():
     assert mgr.port == 5432
 
 
-def test_init_default_min_pool_size_is_2():
-    """min_size defaults to 2 to avoid cold-start races on the first burst.
+def test_init_min_pool_size_defaults_to_zero_outside_prod():
+    """min_size defaults to 0 in non-prod envs (lazy connect).
 
-    The previous default of min=0 in non-prod envs left the pool empty at
-    startup, so concurrent requests fought for the first connection —
-    "another operation is in progress" / "pool is closed" errors.
+    A previous version tried min_size=2 to reduce cold-start races, but
+    that amplified a concurrency bug: the DatabaseManager's disconnect()/
+    connect() path is NOT safe for concurrent callers, and eager init
+    increased the chance of two coroutines racing for the pool. Reverted.
     """
-    env = {"POSTGRES_HOST": "fake-host"}
+    env = {"POSTGRES_HOST": "fake-host", "ENVIRONMENT": "dev"}
+    with patch.dict(os.environ, env, clear=False):
+        mgr = DatabaseManager(host="fake-host", port=5432)
+    assert mgr.min_size == 0
+
+
+def test_init_min_pool_size_two_in_prod():
+    """In prod env, min_size=2 is the original default."""
+    env = {"POSTGRES_HOST": "fake-host", "ENVIRONMENT": "prod"}
     with patch.dict(os.environ, env, clear=False):
         mgr = DatabaseManager(host="fake-host", port=5432)
     assert mgr.min_size == 2
@@ -467,60 +476,65 @@ def test_init_default_min_pool_size_is_2():
 
 def test_init_min_pool_size_explicit_zero_still_honored():
     """Callers who genuinely want lazy connect can pass min_size=0."""
-    env = {"POSTGRES_HOST": "fake-host"}
+    env = {"POSTGRES_HOST": "fake-host", "ENVIRONMENT": "prod"}
     with patch.dict(os.environ, env, clear=False):
         mgr = DatabaseManager(host="fake-host", port=5432, min_size=0)
     assert mgr.min_size == 0
 
 
 @pytest.mark.asyncio
+async def test_ensure_connected_does_no_liveness_probe():
+    """ensure_connected must not acquire a connection just to probe.
 
+    A previous version ran a `SELECT 1` liveness probe and called
+    disconnect()+connect() on failure. That pattern is NOT safe for
+    concurrent callers (segfaults when one coroutine is in disconnect()
+    while another tries to acquire from the closing pool).
 
-
-@pytest.mark.asyncio
-async def test_ensure_connected_retries_liveness_probe_after_reconnect():
-    """If the first liveness probe fails, ensure_connected reconnects and
-    re-probes the *new* pool before returning. Without the re-probe, the
-    caller's next operation can hit a half-state pool and fail.
-
-    Regression: rag_research_tool's wiki /health vs /db-status showed
-    inconsistent results — /db-status succeeded (probe had settled by
-    then), /health failed (probe was racing with a concurrent request).
+    The natural asyncpg pattern is to skip the probe entirely; let
+    `_with_retry` handle transient errors by retrying on a fresh
+    connection from the pool.
     """
     mgr = _make_manager_with_mock_pool()
-
-    # Mock the pool: first acquire() raises ConnectionDoesNotExistError,
-    # second one (after reconnect) succeeds.
-    call_count = [0]
-
-    class _FakeConn:
-        async def execute(self, q, *a):
-            return None
-
-    class _FakeAcquire:
-        def __init__(self, should_fail):
-            self.should_fail = should_fail
-        async def __aenter__(self):
-            call_count[0] += 1
-            if self.should_fail:
-                raise asyncpg.exceptions.ConnectionDoesNotExistError("simulated stale")
-            return _FakeConn()
-        async def __aexit__(self, *a):
-            return None
-
-    def _acquire_factory(*a, **kw):
-        # First call fails, subsequent calls succeed
-        return _FakeAcquire(should_fail=(call_count[0] == 0))
-
+    # pool.acquire should NOT be called at all
     mgr.pool = MagicMock()
-    mgr.pool.acquire = MagicMock(side_effect=_acquire_factory)
+    mgr.pool.acquire = MagicMock()
     mgr.disconnect = AsyncMock()
     mgr.connect = AsyncMock()
 
     await mgr.ensure_connected()
 
-    # Probe ran twice (first failed, second succeeded after reconnect)
+    mgr.pool.acquire.assert_not_called()
+    mgr.disconnect.assert_not_awaited()
+    mgr.connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_with_retry_does_not_disconnect_on_transient_error():
+    """_with_retry must NOT call disconnect() on transient errors.
+
+    Regression: rag_research_tool's wiki revision -00078-bsc segfaulted
+    because _with_retry called disconnect() while another concurrent
+    request was using the pool. Two SIGSEGVs in two minutes.
+
+    Fix: _with_retry just sleeps and retries. asyncpg's pool naturally
+    returns a different connection on the next acquire.
+    """
+    mgr = _make_manager_with_mock_pool()
+    mgr.disconnect = AsyncMock()
+    mgr.connect = AsyncMock()
+
+    call_count = [0]
+
+    async def _flaky():
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise asyncpg.exceptions.ConnectionDoesNotExistError("simulated stale")
+        return 42
+
+    result = await mgr._with_retry(_flaky)
+    assert result == 42
     assert call_count[0] == 2
-    # disconnect + connect each called once (the reconnect path)
-    mgr.disconnect.assert_awaited_once()
-    mgr.connect.assert_awaited_once()
+    # CRITICAL: disconnect and connect must NOT have been called
+    mgr.disconnect.assert_not_awaited()
+    mgr.connect.assert_not_awaited()
