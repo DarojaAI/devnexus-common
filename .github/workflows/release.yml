@@ -22,5 +22,14 @@ jobs:
     uses: DarojaAI/infra-actions/.github/workflows/reusable-semantic-release.yml@v1.3.0
     with:
       working-directory: '.'
+      # The reusable workflow's install step runs
+      #   npm install --save-dev semantic-release@^23.0.0 ...
+      # which downgrades this repo's package.json (we pin ^24.0.0)
+      # and dirties the working tree. The reusable's pre-flight
+      # `git status --porcelain` check then bails with
+      # "Uncommitted changes detected" before semantic-release
+      # even runs. Skip the check; semantic-release itself does
+      # not need a clean tree to analyze commits.
+      skip-dirty-check: true
     secrets:
       github-token: ${{ secrets.GITHUB_TOKEN }}
