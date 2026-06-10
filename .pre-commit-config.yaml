@@ -1,0 +1,46 @@
+# Pre-commit hooks for devnexus-common
+# Sourced from DarojaAI/infra-actions .pre-commit-config.yaml.
+# https://pre-commit.com/index.html
+
+repos:
+  # ─────────────────────────────────────────────────────────────
+  # Essential hooks
+  # ─────────────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: debug-statements
+
+  # ─────────────────────────────────────────────────────────────
+  # Secrets detection
+  # ─────────────────────────────────────────────────────────────
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.2
+    hooks:
+      - id: gitleaks
+
+  # ─────────────────────────────────────────────────────────────
+  # Python formatting and linting
+  # ─────────────────────────────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # ─────────────────────────────────────────────────────────────
+  # GitHub Actions YAML linting
+  # Note: infra-actions's .pre-commit-config.yaml references
+  # github-actions-repo/actionlint, but that repo does not exist
+  # (the upstream is rhysd/actionlint). Using the working repo here.
+  # ─────────────────────────────────────────────────────────────
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.2
+    hooks:
+      - id: actionlint

@@ -47,13 +47,12 @@ Local dev:
     POSTGRES_HOST=10.0.0.21 POSTGRES_USER=... POSTGRES_PASSWORD=... \\
         python -m pytest tests/stress/ -v
 """
+
 from __future__ import annotations
 
-import asyncio
 import os
-import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import List, Tuple
 
 import pytest
@@ -185,9 +184,10 @@ def test_concurrent_cancellation_does_not_segfault(db_manager):
 
     # The manager must still be healthy after the burst
     health = db_manager.health_check_sync()
-    assert health.get("status") in ("healthy", "disabled"), (
-        f"Manager unhealthy after concurrent burst: {health}"
-    )
+    assert health.get("status") in (
+        "healthy",
+        "disabled",
+    ), f"Manager unhealthy after concurrent burst: {health}"
 
     # Log a summary (visible with `pytest -s`)
     print(
@@ -230,7 +230,9 @@ def test_minimal_concurrent_burst_does_not_segfault(db_manager):
         results: List[Tuple[int, str]] = [f.result() for f in done]
 
     assert len(done) == N, f"Only {len(done)}/{N} completed"
-    assert any(r[1].startswith("ok:") for r in results), f"No queries succeeded: {results}"
+    assert any(
+        r[1].startswith("ok:") for r in results
+    ), f"No queries succeeded: {results}"
     # Manager still healthy
     health = db_manager.health_check_sync()
     assert health.get("status") in ("healthy", "disabled")

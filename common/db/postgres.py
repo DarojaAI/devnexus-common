@@ -58,7 +58,9 @@ class DatabaseManager:
 
         # Validate host - reject values with invalid characters
         if "\n" in self.host or "\r" in self.host:
-            raise ValueError(f"POSTGRES_HOST contains invalid characters (newline): {repr(self.host)}")
+            raise ValueError(
+                f"POSTGRES_HOST contains invalid characters (newline): {repr(self.host)}"
+            )
         if not self.host or self.host == "localhost":
             raise ValueError(f"POSTGRES_HOST is not configured: {self.host}")
 
@@ -72,7 +74,9 @@ class DatabaseManager:
         env = os.getenv("ENVIRONMENT", "dev").lower()
         # Use `is not None` (not `or`) so explicit min_size=0 is honored
         # as the lazy-connect opt-out.
-        self.min_size = min_size if min_size is not None else (2 if env == "prod" else 0)
+        self.min_size = (
+            min_size if min_size is not None else (2 if env == "prod" else 0)
+        )
         self.max_size = max_size or (10 if env == "prod" else 5)
         self.pool: Optional[asyncpg.Pool] = None
 
@@ -88,8 +92,12 @@ class DatabaseManager:
         # wiki /db-status returned "PostgreSQL is disabled" after migrate.
         self.enabled = os.getenv("USE_POSTGRESQL", "true").lower() == "true"
 
-        self._application_name = (application_name or os.getenv("POSTGRES_APP_NAME", "devnexus-common")).strip()
-        self._search_path = (search_path or os.getenv("POSTGRES_SEARCH_PATH", "public")).strip()
+        self._application_name = (
+            application_name or os.getenv("POSTGRES_APP_NAME", "devnexus-common")
+        ).strip()
+        self._search_path = (
+            search_path or os.getenv("POSTGRES_SEARCH_PATH", "public")
+        ).strip()
 
         # Dedicated event loop for the sync facade (issues #7/#9).
         # asyncpg's pool is bound to whichever loop is running when the pool
@@ -118,7 +126,6 @@ class DatabaseManager:
         # not racing with active acquirers).
         self._needs_pool_reset: bool = False
 
-
     async def connect(self) -> None:
         """Establish connection pool to PostgreSQL."""
         if not self.enabled:
@@ -138,7 +145,11 @@ class DatabaseManager:
 
         # Configure SSL behaviour from environment
         ssl_mode = os.getenv("POSTGRES_SSLMODE", "disable").lower()
-        ssl_no_verify = os.getenv("POSTGRES_SSL_NO_VERIFY", "false").lower() in ("1", "true", "yes")
+        ssl_no_verify = os.getenv("POSTGRES_SSL_NO_VERIFY", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         ssl_arg = None
         if ssl_mode in ("disable", "false", "0"):
             ssl_arg = False
@@ -187,9 +198,13 @@ class DatabaseManager:
                     err_text = str(e).lower()
                     logger.error(f"asyncpg.create_pool failed (ssl={ssl_arg!r}): {e}")
                     if ssl_arg not in (False,) and (
-                        "ssl" in err_text or "certificate" in err_text or "tls" in err_text
+                        "ssl" in err_text
+                        or "certificate" in err_text
+                        or "tls" in err_text
                     ):
-                        logger.warning("Detected SSL-related failure, retrying once with ssl=False")
+                        logger.warning(
+                            "Detected SSL-related failure, retrying once with ssl=False"
+                        )
                         try:
                             self.pool = await asyncio.wait_for(
                                 asyncpg.create_pool(
@@ -224,7 +239,9 @@ class DatabaseManager:
                         "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
                     )
                     if result:
-                        logger.info(f"pgvector extension detected: v{result['extversion']}")
+                        logger.info(
+                            f"pgvector extension detected: v{result['extversion']}"
+                        )
                     else:
                         logger.warning("pgvector extension not found")
 
@@ -234,7 +251,9 @@ class DatabaseManager:
                 return
 
             except Exception as e:
-                logger.error(f"Failed to connect to PostgreSQL (attempt {attempt}): {e}")
+                logger.error(
+                    f"Failed to connect to PostgreSQL (attempt {attempt}): {e}"
+                )
                 try:
                     if self.pool is not None:
                         await self.pool.close()
@@ -243,7 +262,9 @@ class DatabaseManager:
                     pass
 
                 if attempt == max_attempts:
-                    logger.error("Exceeded max connection attempts to PostgreSQL — giving up")
+                    logger.error(
+                        "Exceeded max connection attempts to PostgreSQL — giving up"
+                    )
                     self._connection_state = "failed"
                     self._connection_error = str(e)
                     raise
@@ -315,8 +336,10 @@ class DatabaseManager:
             except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError) as e:
                 if attempt == max_retries:
                     raise
-                logger.warning(f"DB transient error, retrying ({attempt + 1}/{max_retries}): {e}")
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                logger.warning(
+                    f"DB transient error, retrying ({attempt + 1}/{max_retries}): {e}"
+                )
+                await asyncio.sleep(0.5 * (2**attempt))
             except asyncio.CancelledError:
                 # Issue #7: cancellation safety. When the in-flight op is
                 # cancelled, asyncpg's pool/connection can be left in a
@@ -431,7 +454,9 @@ class DatabaseManager:
                 embedding = EXCLUDED.embedding
             RETURNING id
         """
-        return await self.fetchval(query, repo_id, name, description, context, embedding)
+        return await self.fetchval(
+            query, repo_id, name, description, context, embedding
+        )
 
     async def find_similar_patterns(
         self,
@@ -472,12 +497,16 @@ class DatabaseManager:
             for row in rows
         ]
 
-    async def update_pattern_embedding(self, pattern_id: int, embedding: List[float]) -> None:
+    async def update_pattern_embedding(
+        self, pattern_id: int, embedding: List[float]
+    ) -> None:
         """Update embedding for existing pattern."""
         query = "UPDATE patterns SET embedding = $1::vector WHERE id = $2"
         await self.execute(query, embedding, pattern_id)
 
-    async def get_patterns_without_embeddings(self, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_patterns_without_embeddings(
+        self, limit: int = 100
+    ) -> List[Dict[str, Any]]:
         """Get patterns that don't have embeddings yet."""
         query = """
             SELECT
@@ -504,7 +533,6 @@ class DatabaseManager:
             }
             for row in rows
         ]
-
 
     # ============================================
     # Sync facade
@@ -687,12 +715,11 @@ class DatabaseManager:
         await self.ensure_connected()
         total = 0
         from itertools import chain
+
         for i in range(0, len(rows), page_size):
             page = rows[i : i + page_size]
             params = list(chain.from_iterable(page))
-            result = await self._with_retry(
-                lambda: self._execute_impl(sql, *params)
-            )
+            result = await self._with_retry(lambda: self._execute_impl(sql, *params))
             # asyncpg returns "INSERT 0 42" for inserts; the trailing
             # number is rows-inserted. Parse defensively.
             try:
@@ -712,8 +739,9 @@ class DatabaseManager:
     ) -> str:
         """Sync wrapper for bulk_insert()."""
         return self._run_sync(
-            self.bulk_insert(table, columns, rows,
-                             on_conflict=on_conflict, page_size=page_size)
+            self.bulk_insert(
+                table, columns, rows, on_conflict=on_conflict, page_size=page_size
+            )
         )
 
 

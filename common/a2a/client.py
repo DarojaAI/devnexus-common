@@ -45,10 +45,10 @@ logger = logging.getLogger("common.a2a.client")
 # ---------------------------------------------------------------------------
 # Retry policy defaults
 # ---------------------------------------------------------------------------
-DEFAULT_TIMEOUT = 30          # seconds for single request
+DEFAULT_TIMEOUT = 30  # seconds for single request
 DEFAULT_MAX_RETRIES = 3
-DEFAULT_BACKOFF_BASE = 1.0    # seconds
-DEFAULT_BACKOFF_MAX = 30.0    # seconds
+DEFAULT_BACKOFF_BASE = 1.0  # seconds
+DEFAULT_BACKOFF_MAX = 30.0  # seconds
 
 # Terminal workflow states — polling stops here
 TERMINAL_STATES = {"completed", "failed", "partial_success"}
@@ -58,9 +58,11 @@ TERMINAL_STATES = {"completed", "failed", "partial_success"}
 # Data models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class AgentInfo:
     """Parsed AgentCard from /.well-known/agent.json"""
+
     name: str
     description: str
     version: str
@@ -85,6 +87,7 @@ class AgentInfo:
 @dataclass
 class SkillInfo:
     """Parsed skill entry from the A2A manifest."""
+
     skill_id: str
     skill_name: str
     description: str
@@ -119,6 +122,7 @@ class SkillInfo:
 # ---------------------------------------------------------------------------
 # Core client
 # ---------------------------------------------------------------------------
+
 
 class A2AClient:
     """
@@ -243,12 +247,16 @@ class A2AClient:
                 last_err = e
                 if attempt < self.max_retries:
                     sleep = min(
-                        self.backoff_base * (2 ** attempt),
+                        self.backoff_base * (2**attempt),
                         self.backoff_max,
                     )
                     logger.warning(
                         "[A2A] Transient error on %s (attempt %d/%d), retrying in %.1fs: %s",
-                        url, attempt + 1, self.max_retries + 1, sleep, e,
+                        url,
+                        attempt + 1,
+                        self.max_retries + 1,
+                        sleep,
+                        e,
                     )
                     time.sleep(sleep)
                 continue
@@ -266,16 +274,24 @@ class A2AClient:
                 status_code = getattr(e.response, "status_code", 0) if e.response else 0
                 if 500 <= status_code < 600 and attempt < self.max_retries:
                     last_err = e
-                    sleep = min(self.backoff_base * (2 ** attempt), self.backoff_max)
+                    sleep = min(self.backoff_base * (2**attempt), self.backoff_max)
                     logger.warning(
                         "[A2A] Server error %d on %s (attempt %d/%d), retrying in %.1fs",
-                        status_code, url, attempt + 1, self.max_retries + 1, sleep,
+                        status_code,
+                        url,
+                        attempt + 1,
+                        self.max_retries + 1,
+                        sleep,
                     )
                     time.sleep(sleep)
                     continue
                 raise A2AError(
                     f"HTTP {e.response.status_code} from {url}: {e.response.text[:500]}",
-                    details={"url": url, "status": e.response.status_code, "body": e.response.text[:500]},
+                    details={
+                        "url": url,
+                        "status": e.response.status_code,
+                        "body": e.response.text[:500],
+                    },
                 ) from e
 
         # Exhausted retries
@@ -403,7 +419,9 @@ class A2AClient:
             A2AAuthenticationError: If auth is required but missing/invalid.
         """
         payload = {"skill_id": skill_id, "input": input_data or {}}
-        result = self._request("POST", "/a2a/execute", json_payload=payload, timeout=timeout)
+        result = self._request(
+            "POST", "/a2a/execute", json_payload=payload, timeout=timeout
+        )
 
         if result.get("success") is False:
             raise A2ASkillExecutionError(
@@ -415,7 +433,8 @@ class A2AClient:
     def cancel_workflow(self, workflow_id: str) -> Dict[str, Any]:
         """Cancel a running workflow."""
         return self._request(
-            "POST", "/a2a/cancel",
+            "POST",
+            "/a2a/cancel",
             json_payload={"workflow_id": workflow_id},
         )
 
@@ -472,13 +491,17 @@ class A2AClient:
             if last_status in TERMINAL_STATES:
                 logger.info(
                     "[A2A] Workflow %s finished with status '%s' (%.1fs)",
-                    workflow_id, last_status, elapsed,
+                    workflow_id,
+                    last_status,
+                    elapsed,
                 )
                 return status
 
             logger.debug(
                 "[A2A] Workflow %s status='%s', polling again in %ds",
-                workflow_id, last_status, interval,
+                workflow_id,
+                last_status,
+                interval,
             )
             time.sleep(interval)
 
@@ -517,7 +540,9 @@ class A2AClient:
 
     def get_dashboard_overview(self, time_range_days: int = 30) -> Dict[str, Any]:
         """Convenience wrapper for the ``get_dashboard_overview`` skill."""
-        return self.execute("get_dashboard_overview", {"time_range_days": time_range_days})
+        return self.execute(
+            "get_dashboard_overview", {"time_range_days": time_range_days}
+        )
 
     def assess_cicd_pipeline(
         self,
@@ -530,7 +555,8 @@ class A2AClient:
             "assess_cicd_pipeline",
             {
                 "repo_path": repo_path,
-                "dimensions": dimensions or ["precommit", "ci_workflows", "terraform_ci", "caching"],
+                "dimensions": dimensions
+                or ["precommit", "ci_workflows", "terraform_ci", "caching"],
                 "standards": standards,
             },
         )
@@ -539,6 +565,7 @@ class A2AClient:
 # ---------------------------------------------------------------------------
 # External agent registry
 # ---------------------------------------------------------------------------
+
 
 class ExternalAgentRegistry:
     """
@@ -585,16 +612,21 @@ class ExternalAgentRegistry:
 # Quick CLI smoke-test
 # ---------------------------------------------------------------------------
 
+
 def _main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="A2A client smoke test")
     parser.add_argument("--url", required=True, help="A2A server base URL")
-    parser.add_argument("--token", default=os.environ.get("A2A_TOKEN", ""), help="Auth token")
+    parser.add_argument(
+        "--token", default=os.environ.get("A2A_TOKEN", ""), help="Auth token"
+    )
     parser.add_argument("--discover", action="store_true", help="List all skills")
     parser.add_argument("--skill", help="Skill ID to execute")
     parser.add_argument("--input", default="{}", help="JSON input for the skill")
-    parser.add_argument("--poll", action="store_true", help="Poll if workflow_id returned")
+    parser.add_argument(
+        "--poll", action="store_true", help="Poll if workflow_id returned"
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
