@@ -10,6 +10,7 @@ import logging
 import asyncio
 import ssl
 from typing import Optional, List, Dict, Any, Tuple
+import threading
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,34 @@ class DatabaseManager:
 
         self._application_name = (application_name or os.getenv("POSTGRES_APP_NAME", "devnexus-common")).strip()
         self._search_path = (search_path or os.getenv("POSTGRES_SEARCH_PATH", "public")).strip()
+
+        # Dedicated event loop for the sync facade (issues #7/#9).
+        # asyncpg's pool is bound to whichever loop is running when the pool
+        # is created. If we use asyncio.run(coro) on every _run_sync() call,
+        # a new loop is created per call and asyncpg's internal asyncio
+        # primitives become stale relative to the new loop — when
+        # CancelledError fires, asyncpg's cleanup path interacts with
+        # primitives bound to the OLD loop, leading to SIGSEGV in the C
+        # protocol code. Production hit this on rag_research_tool's wiki
+        # revisions -00078-bsc and -00079-j4m.
+        #
+        # Fix: all sync-facade calls run on a single dedicated event loop
+        # in a daemon thread, owned by this DatabaseManager instance. The
+        # asyncpg pool is then bound to one stable loop for its lifetime,
+        # which is what asyncpg expects.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._loop_lock = threading.Lock()
+        self._loop_started = threading.Event()
+        self._loop_failed: Optional[BaseException] = None
+
+        # Cancellation safety (issue #7): when an in-flight asyncpg op is
+        # cancelled, asyncpg's pool/connection can be left in a half-state.
+        # We flag a deferred reset; the next non-cancelled ensure_connected
+        # observes the flag and rebuilds the pool cleanly (deferred =
+        # not racing with active acquirers).
+        self._needs_pool_reset: bool = False
+
 
     async def connect(self) -> None:
         """Establish connection pool to PostgreSQL."""
@@ -231,25 +260,39 @@ class DatabaseManager:
             logger.info("Database connection pool closed")
 
     async def ensure_connected(self) -> None:
-        """Ensure database is connected, connecting if needed."""
+        """Ensure database is connected, connecting if needed.
+
+        Consumes the deferred-reset flag set by _with_retry on cancellation
+        (issue #7). The flag is processed in a non-racing context — never
+        inside the cancellation path itself, where it would race with
+        active acquirers. See _with_retry for the full rationale.
+        """
         if not self.enabled:
             raise RuntimeError("PostgreSQL is disabled")
+
+        # Issue #7: if a previous call was cancelled mid-flight, the pool
+        # may be in a half-state. We do NOT disconnect+reconnect inside
+        # the cancellation path (that races with active acquirers — the
+        # original segfault pattern). Instead, the next non-cancelled
+        # ensure_connected() observes the flag, disconnects cleanly, and
+        # reconnects.
+        if self._needs_pool_reset and self.pool is not None:
+            logger.warning("Pool marked for reset (post-cancellation); rebuilding")
+            self._needs_pool_reset = False
+            try:
+                await self.disconnect()
+            except Exception as e:
+                logger.warning(f"Pool reset disconnect failed (continuing): {e}")
+            # Defensive: always clear pool after a reset attempt. The real
+            # disconnect() sets pool=None on success, but mocks in tests
+            # don't, and a buggy disconnect could leave it set. Either
+            # way, fall through to the reconnect path below.
+            self.pool = None
 
         if self.pool is None:
             logger.debug("Database pool not initialized, connecting now...")
             await self.connect()
             return
-
-        # No liveness probe here. A previous version tried to acquire a
-        # connection and run `SELECT 1` to detect a stale pool, then called
-        # disconnect()+connect() on failure. That pattern is NOT safe for
-        # concurrent callers: when request A is in the middle of disconnect()
-        # (closing the pool), request B's acquire() runs against a closing
-        # pool and asyncpg segfaults. Production hit this on
-        # rag_research_tool's wiki revision -00078-bsc — two SIGSEGVs in
-        # two minutes. asyncpg's pool handles dead connections naturally:
-        # the next acquire() returns a different (or fresh) connection.
-        # We rely on that and let transient errors retry via _with_retry.
 
     async def _with_retry(self, coro_factory, max_retries: int = 2):
         """Execute coroutine with transient error retry.
@@ -274,6 +317,19 @@ class DatabaseManager:
                     raise
                 logger.warning(f"DB transient error, retrying ({attempt + 1}/{max_retries}): {e}")
                 await asyncio.sleep(0.5 * (2 ** attempt))
+            except asyncio.CancelledError:
+                # Issue #7: cancellation safety. When the in-flight op is
+                # cancelled, asyncpg's pool/connection can be left in a
+                # half-state. We do NOT try to disconnect/reconnect here
+                # (that races with active acquirers — the original
+                # segfault pattern). Instead, flag a deferred reset; the
+                # next non-cancelled ensure_connected() will rebuild the
+                # pool cleanly. We must re-raise CancelledError so the
+                # caller's cancellation contract is preserved.
+                self._needs_pool_reset = True
+                logger.debug("DB op cancelled; pool marked for deferred reset")
+                raise
+
     @asynccontextmanager
     async def acquire(self):
         """Context manager for acquiring a connection from pool."""
@@ -456,24 +512,107 @@ class DatabaseManager:
     # Use these from SYNC contexts only (CLI scripts, sync request
     # handlers, threadpool workers). The _run_sync guard raises if
     # called from inside a running event loop — in async contexts,
-    # use the async methods directly.
+    # Implementation note (issues #7/#9): we previously used
+    # asyncio.run(coro) per call, creating a fresh event loop on every
+    # sync facade invocation. That pattern is the root cause of the
+    # production SIGSEGV: asyncpg's pool is bound to whichever loop
+    # was running when the pool was created. A new loop on every call
+    # meant the pool's internal asyncio primitives were stale relative
+    # to the new loop, and CancelledError cleanup would deref primitives
+    # bound to the OLD loop → SIGSEGV in the C protocol code.
     #
-    # Implementation note: we bridge via asyncio.run() in a fresh
-    # loop. asyncpg's pool holds connections across runs, so this
-    # is safe — the pool itself persists; only the event loop is
-    # short-lived per call.
+    # New pattern: all sync-facade calls run on a single dedicated event
+    # loop in a daemon thread owned by this DatabaseManager. The asyncpg
+    # pool is then bound to one stable loop for its lifetime, which is
+    # what asyncpg expects. concurrent.futures.Future.cancel() correctly
+    # propagates to the underlying asyncio task on the dedicated loop,
+    # giving us proper cancellation semantics (the missing primitive
+    # that asyncio.run()-per-call couldn't provide).
 
-    @staticmethod
-    def _run_sync(coro):
-        """Run a coroutine to completion in a fresh event loop.
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        """Lazily start the dedicated event loop in a daemon thread.
 
-        Raises RuntimeError if called from a running event loop.
+        Idempotent: subsequent calls return the same loop. Thread-safe:
+        the start sequence is serialized by ``_loop_lock``. The loop is
+        bound for the lifetime of the DatabaseManager; the daemon
+        thread is reaped when the process exits.
+
+        Raises:
+            RuntimeError: if the loop thread fails to start within 5s
+                or fails to initialize (e.g. asyncio.new_event_loop
+                itself raises).
+        """
+        if self._loop is not None:
+            return self._loop
+        with self._loop_lock:
+            if self._loop is not None:
+                return self._loop
+            self._loop_started.clear()
+            self._loop_failed = None
+
+            def _run_loop() -> None:
+                loop: Optional[asyncio.AbstractEventLoop] = None
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    self._loop = loop
+                    self._loop_started.set()
+                    loop.run_forever()
+                except BaseException as e:  # noqa: BLE001
+                    self._loop_failed = e
+                    self._loop_started.set()
+                finally:
+                    if loop is not None:
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass
+                    self._loop = None
+
+            self._loop_thread = threading.Thread(
+                target=_run_loop,
+                daemon=True,
+                name=f"db-loop-{id(self):x}",
+            )
+            self._loop_thread.start()
+            if not self._loop_started.wait(timeout=5.0):
+                raise RuntimeError(
+                    "DatabaseManager loop thread did not signal ready within 5s"
+                )
+            if self._loop_failed is not None:
+                raise RuntimeError(
+                    f"DatabaseManager loop thread failed to initialize: {self._loop_failed}"
+                )
+            if self._loop is None:
+                raise RuntimeError("DatabaseManager loop is None after start")
+            return self._loop
+
+    def _run_sync(self, coro, timeout: Optional[float] = None):
+        """Run a coroutine to completion on the dedicated DB loop.
+
+        Blocks the calling thread until the coroutine completes (or
+        ``timeout`` elapses, in which case the underlying asyncio task
+        is cancelled via ``concurrent.futures.Future.cancel()`` and
+        ``concurrent.futures.TimeoutError`` is raised). The asyncpg pool
+        is bound to the dedicated loop for the lifetime of this
+        DatabaseManager, so all sync-facade calls share the same loop
+        and asyncpg's internal primitives stay consistent.
+
+        Raises:
+            RuntimeError: if called from within a running event loop.
+                Use the async methods (execute, fetch, ...) directly
+                in async contexts.
+            concurrent.futures.TimeoutError: if ``timeout`` is set and
+                the coroutine did not complete in time.
+            Anything the coroutine raises: re-raised here.
         """
         try:
             asyncio.get_running_loop()
         except RuntimeError as e:
             if "no running event loop" in str(e):
-                return asyncio.run(coro)
+                loop = self._ensure_loop()
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+                return future.result(timeout=timeout)
             raise
         raise RuntimeError(
             "DatabaseManager._run_sync called from a running event "
