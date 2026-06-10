@@ -9,6 +9,15 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# The reusable-pre-commit workflow needs pull-requests: write to post
+# its result comment. The default GITHUB_TOKEN only grants
+# pull-requests: none, which makes the workflow call fail at startup
+# with: "requesting 'pull-requests: write', but is only allowed
+# 'pull-requests: none'". Grant it explicitly at the workflow level.
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   actionlint:
     name: Lint GitHub Actions workflows
