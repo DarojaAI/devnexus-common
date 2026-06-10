@@ -6,9 +6,9 @@ on:
       - main
   workflow_dispatch:
 
-concurrency:
-  group: semantic-release-${{ github.repository }}
-  cancel-in-progress: true
+# Concurrency is managed by the reusable-semantic-release workflow itself.
+# Defining a matching group here causes a deadlock-cancel.
+# See: https://github.com/DarojaAI/devnexus-common/actions/runs/27252116281
 
 permissions:
   contents: write
