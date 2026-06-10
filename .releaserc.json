@@ -23,7 +23,11 @@
       "@semantic-release/github",
       {
         "draft": false,
-        "prerelease": false
+        "prerelease": false,
+        "successComment": false,
+        "failComment": false,
+        "labels": false,
+        "releasedLabels": false
       }
     ]
   ]
