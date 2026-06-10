@@ -75,17 +75,37 @@ except ImportError:  # pragma: no cover - Phase 1 fallback
 
     _TRANSLATOR_AVAILABLE = False
 
+
+# Phase 2 (issue #28): psycopg 3 backend. Lazily imported so a project
+# that doesn't have psycopg / psycopg_pool installed (or runs an
+# older build) can still import this module and use asyncpg. When
+# the import fails the registry simply omits the "psycopg3" entry
+# and ``DatabaseManager(backend="psycopg3", ...)`` raises a clear
+# ValueError in ``__init__`` (line 313-317 below).
+try:
+    from common.db.backends.psycopg3 import Psycopg3Backend
+
+    _PSYCOPG3_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only without psycopg
+    Psycopg3Backend = None  # type: ignore[misc,assignment]
+    _PSYCOPG3_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
-
-# Backend name -> backend class. Phase 1 only ships asyncpg; psycopg 3
-# is added in issue #28. Importing the class (not the module) here
-# would create a circular dependency with backends/__init__, so we
-# import from the concrete module.
+# Backend name -> backend class. Phase 1 shipped asyncpg; Phase 2
+# (issue #28) added the psycopg 3 backend. Importing the classes
+# (not the modules) here would create a circular dependency with
+# backends/__init__, so we import from the concrete modules.
+#
+# ``psycopg3`` is only registered when the lazy import above
+# succeeded; otherwise constructing a manager with
+# ``backend="psycopg3"`` raises the standard "Unknown backend"
+# ValueError from ``__init__``.
 _BACKEND_REGISTRY: Dict[str, type] = {
     "asyncpg": AsyncpgBackend,
 }
-
+if _PSYCOPG3_AVAILABLE:
+    _BACKEND_REGISTRY["psycopg3"] = Psycopg3Backend
 
 # ---------------------------------------------------------------------------
 # Pool saturation metrics (issue #687)
@@ -635,24 +655,57 @@ class DatabaseManager:
         return await self._with_retry(lambda: self._execute_impl(query, *args))
 
     async def _execute_impl(self, query: str, *args: Any) -> str:
+        # Phase 2 (issue #28): when the configured backend is psycopg 3,
+        # hand the query to the backend after running it through the
+        # asyncpg→psycopg placeholder translator. The asyncpg path is
+        # preserved verbatim so the existing 82 tests (which set
+        # ``self.pool`` directly via ``__new__``-bypass) keep working
+        # without changes; ``getattr`` makes the dispatch tolerant of
+        # the bypass-__init__ test path where ``self._backend`` may
+        # not be set yet.
+        backend = getattr(self, "_backend", None)
+        if backend is not None and backend.name != "asyncpg":
+            translated = translate_asyncpg_to_psycopg(query)
+            return await backend.execute(translated, *args)
         async with self.pool.acquire() as conn:
             return await conn.execute(query, *args)
 
-    async def fetch(self, query: str, *args: Any) -> List[asyncpg.Record]:
-        """Fetch multiple rows."""
+    async def fetch(self, query: str, *args: Any) -> List[Any]:
+        """Fetch multiple rows.
+
+        Return type is ``List[Any]`` (was ``List[asyncpg.Record]``
+        pre-issue-#28) so the same signature covers both the asyncpg
+        and psycopg 3 backends; the row objects differ in type but
+        both support ``row[0]`` / ``row["col"]`` / ``row.keys()`` so
+        callsites that used the asyncpg ``Record`` continue to work.
+        """
         await self.ensure_connected()
         return await self._with_retry(lambda: self._fetch_impl(query, *args))
 
-    async def _fetch_impl(self, query: str, *args: Any) -> List[asyncpg.Record]:
+    async def _fetch_impl(self, query: str, *args: Any) -> List[Any]:
+        backend = getattr(self, "_backend", None)
+        if backend is not None and backend.name != "asyncpg":
+            translated = translate_asyncpg_to_psycopg(query)
+            return await backend.fetch(translated, *args)
         async with self.pool.acquire() as conn:
             return await conn.fetch(query, *args)
 
-    async def fetchrow(self, query: str, *args: Any) -> Optional[asyncpg.Record]:
-        """Fetch single row."""
+    async def fetchrow(self, query: str, *args: Any) -> Optional[Any]:
+        """Fetch single row.
+
+        Return type is ``Optional[Any]`` (was ``Optional[asyncpg.Record]``
+        pre-issue-#28) so the same signature covers both backends; the
+        underlying row objects differ in type but support the same
+        ``row[0]`` / ``row["col"]`` access pattern.
+        """
         await self.ensure_connected()
         return await self._with_retry(lambda: self._fetchrow_impl(query, *args))
 
-    async def _fetchrow_impl(self, query: str, *args: Any) -> Optional[asyncpg.Record]:
+    async def _fetchrow_impl(self, query: str, *args: Any) -> Optional[Any]:
+        backend = getattr(self, "_backend", None)
+        if backend is not None and backend.name != "asyncpg":
+            translated = translate_asyncpg_to_psycopg(query)
+            return await backend.fetchrow(translated, *args)
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(query, *args)
 
@@ -662,6 +715,10 @@ class DatabaseManager:
         return await self._with_retry(lambda: self._fetchval_impl(query, *args))
 
     async def _fetchval_impl(self, query: str, *args: Any) -> Any:
+        backend = getattr(self, "_backend", None)
+        if backend is not None and backend.name != "asyncpg":
+            translated = translate_asyncpg_to_psycopg(query)
+            return await backend.fetchval(translated, *args)
         async with self.pool.acquire() as conn:
             return await conn.fetchval(query, *args)
 
