@@ -61,15 +61,17 @@ class DatabaseManager:
         if not self.host or self.host == "localhost":
             raise ValueError(f"POSTGRES_HOST is not configured: {self.host}")
 
-        # Pool sizing: keep at least 2 connections warm to avoid cold-start
-        # races when multiple Cloud Run / FastAPI requests hit the facade
-        # concurrently. The previous default of min=0 in non-prod envs caused
-        # "another operation is in progress" / "pool is closed" failures
-        # on the first burst of requests after a cold start or a stale-pool
-        # reconnect. Callers who genuinely want lazy connect can pass
-        # min_size=0 explicitly.
+        # Pool sizing: keep the original 0/2-by-env default. The previous
+        # min_size=2 default amplified a concurrency bug: the DatabaseManager's
+        # disconnect()/connect() path is NOT safe for concurrent callers, and
+        # eager connection init increased the chance of two coroutines racing
+        # for the pool at startup. Reverted to the original sizing — the
+        # natural-asyncpg pattern (lazy connect + let the pool recycle dead
+        # connections) is the correct way to handle this.
         env = os.getenv("ENVIRONMENT", "dev").lower()
-        self.min_size = min_size if min_size is not None else 2
+        # Use `is not None` (not `or`) so explicit min_size=0 is honored
+        # as the lazy-connect opt-out.
+        self.min_size = min_size if min_size is not None else (2 if env == "prod" else 0)
         self.max_size = max_size or (10 if env == "prod" else 5)
         self.pool: Optional[asyncpg.Pool] = None
 
@@ -238,29 +240,32 @@ class DatabaseManager:
             await self.connect()
             return
 
-        # Liveness probe with retry-after-reconnect: detect a stale pool where
-        # connections died mid-operation (e.g. PG server restart, or a
-        # concurrent request closed a connection we were about to use). If
-        # the probe fails, force a reconnect, then re-probe the *new* pool
-        # before returning. Without the re-probe, the caller's next
-        # operation can hit a half-state pool and fail with
-        # "cannot perform operation: another operation is in progress" or
-        # "pool is closed" — the symptoms we hit in production on
-        # rag_research_tool's wiki /health vs /db-status.
-        for attempt in range(2):
-            try:
-                async with self.pool.acquire(timeout=2) as conn:
-                    await conn.execute("SELECT 1")
-                return
-            except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError, asyncio.TimeoutError) as e:
-                if attempt == 1:
-                    raise
-                logger.warning(f"DB pool stale — forcing reconnect: {e}")
-                await self.disconnect()
-                await self.connect()
+        # No liveness probe here. A previous version tried to acquire a
+        # connection and run `SELECT 1` to detect a stale pool, then called
+        # disconnect()+connect() on failure. That pattern is NOT safe for
+        # concurrent callers: when request A is in the middle of disconnect()
+        # (closing the pool), request B's acquire() runs against a closing
+        # pool and asyncpg segfaults. Production hit this on
+        # rag_research_tool's wiki revision -00078-bsc — two SIGSEGVs in
+        # two minutes. asyncpg's pool handles dead connections naturally:
+        # the next acquire() returns a different (or fresh) connection.
+        # We rely on that and let transient errors retry via _with_retry.
 
     async def _with_retry(self, coro_factory, max_retries: int = 2):
-        """Execute coroutine with transient error retry."""
+        """Execute coroutine with transient error retry.
+
+        IMPORTANT: do NOT call disconnect()/connect() inside this loop. A
+        previous version did `await self.disconnect()` on transient error
+        to force a fresh pool. That pattern is unsafe for concurrent
+        callers: when request A is in the middle of disconnect() (closing
+        the pool), request B's acquire() runs against a closing pool and
+        asyncpg segfaults. Production hit this on rag_research_tool's wiki
+        revision -00078-bsc.
+
+        The natural asyncpg pattern is to retry the operation. When a
+        connection dies, the pool marks it as broken and the next
+        acquire() returns a different (or freshly created) connection.
+        """
         for attempt in range(max_retries + 1):
             try:
                 return await coro_factory()
@@ -268,14 +273,7 @@ class DatabaseManager:
                 if attempt == max_retries:
                     raise
                 logger.warning(f"DB transient error, retrying ({attempt + 1}/{max_retries}): {e}")
-                await self.disconnect()
                 await asyncio.sleep(0.5 * (2 ** attempt))
-                try:
-                    await self.connect()
-                except Exception as connect_err:
-                    logger.error(f"Reconnect failed during retry attempt {attempt + 1}: {connect_err}")
-                    raise
-
     @asynccontextmanager
     async def acquire(self):
         """Context manager for acquiring a connection from pool."""
