@@ -62,6 +62,11 @@ def _make_manager_with_mock_pool(
     mgr._application_name = "test"
     mgr._search_path = "public"
 
+    # Issue #686: env-var-driven statement_timeout. Tests that bypass
+    # __init__ via __new__() must set this manually or connect() will
+    # AttributeError on self.statement_timeout_ms.
+    mgr.statement_timeout_ms = int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", "30000"))
+
     # Issue #7: cancellation-safety state.
     mgr._needs_pool_reset = False
 

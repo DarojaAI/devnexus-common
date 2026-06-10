@@ -164,6 +164,17 @@ class DatabaseManager:
             search_path or os.getenv("POSTGRES_SEARCH_PATH", "public")
         ).strip()
 
+        # Statement timeout (ms) — applied as a session setting (statement_timeout)
+        # AND as asyncpg's per-operation command_timeout (seconds). Both
+        # bound the runtime of any single query. The value is
+        # POSTGRES_STATEMENT_TIMEOUT_MS (default 30000 = 30s), tunable
+        # per-tool for batch jobs that legitimately need longer. Issue #686.
+        # Stored as int ms internally; converted to float seconds for
+        # command_timeout at call time.
+        self.statement_timeout_ms = int(
+            os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", "30000")
+        )
+
         # Dedicated event loop for the sync facade (issues #7/#9).
         # asyncpg's pool is bound to whichever loop is running when the pool
         # is created. If we use asyncio.run(coro) on every _run_sync() call,
@@ -248,13 +259,13 @@ class DatabaseManager:
                             ssl=ssl_arg,
                             min_size=self.min_size,
                             max_size=self.max_size,
-                            command_timeout=30,
+                            command_timeout=self.statement_timeout_ms / 1000.0,
                             max_inactive_connection_lifetime=300,
                             max_queries=1000,
                             server_settings={
                                 "application_name": self._application_name,
                                 "search_path": self._search_path,
-                                "statement_timeout": "30000",
+                                "statement_timeout": str(self.statement_timeout_ms),
                             },
                         ),
                         timeout=10,
@@ -281,13 +292,15 @@ class DatabaseManager:
                                     ssl=False,
                                     min_size=self.min_size,
                                     max_size=self.max_size,
-                                    command_timeout=30,
+                                    command_timeout=self.statement_timeout_ms / 1000.0,
                                     max_inactive_connection_lifetime=300,
                                     max_queries=1000,
                                     server_settings={
                                         "application_name": self._application_name,
                                         "search_path": self._search_path,
-                                        "statement_timeout": "30000",
+                                        "statement_timeout": str(
+                                            self.statement_timeout_ms
+                                        ),
                                     },
                                 ),
                                 timeout=10,
