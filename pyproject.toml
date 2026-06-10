@@ -12,13 +12,14 @@ license = {text = "MIT"}
 authors = [
     {name = "DarojaAI"},
 ]
-keywords = ["postgres", "llm", "a2a", "tracing", "gcp", "notifications"]
+keywords = ["postgres", "llm", "a2a", "tracing", "gcp", "notifications", "compliance"]
 dependencies = [
     "asyncpg>=0.29",
     "requests>=2.31",
     "python-dotenv>=1.0",
     "httpx>=0.26",
     "starlette>=0.35",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
