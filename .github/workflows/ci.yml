@@ -19,18 +19,12 @@ permissions:
   pull-requests: write
 
 jobs:
-  actionlint:
-    name: Lint GitHub Actions workflows
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Run actionlint
-        uses: docker://ghcr.io/elasticinfra/actionlint:latest
-        with:
-          args: '.'
-
+  # actionlint coverage is provided by the pre-commit job below
+  # (the `actionlint` hook in .pre-commit-config.yaml). A standalone
+  # actionlint job using `docker://ghcr.io/elasticinfra/actionlint:latest`
+  # was removed because that image returns 403 on the manifest endpoint —
+  # it appears to be unpublished or private. Same image is used in
+  # DarojaAI/infra-actions's own ci.yml and is broken there too.
   lint-workflows:
     name: Pre-Commit Validation
     uses: DarojaAI/infra-actions/.github/workflows/reusable-pre-commit.yml@v1.3.0
