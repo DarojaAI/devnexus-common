@@ -12,7 +12,7 @@ license = {text = "MIT"}
 authors = [
     {name = "DarojaAI"},
 ]
-keywords = ["postgres", "llm", "a2a", "tracing", "gcp", "notifications", "compliance"]
+keywords = ["postgres", "llm", "a2a", "tracing", "gcp", "notifications"]
 dependencies = [
     "asyncpg>=0.29",
     "requests>=2.31",
