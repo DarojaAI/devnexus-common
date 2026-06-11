@@ -102,6 +102,48 @@ sustained). Run the `test_pool_saturation.py` stress test before rolling
 out a new downstream consumer to make sure your workload doesn't trip
 the alert under normal traffic.
 
+### Database Backends
+
+`DatabaseManager` supports two PostgreSQL drivers (issue #29):
+
+| Driver | Default | When to use |
+|---|---|---|
+| **asyncpg** | yes | The default. Fastest (C-accelerated). Has known C-level concurrency bugs around cancellation — mitigated by the dedicated-loop fix in PR #10 but not eliminated. |
+| **psycopg 3** | no (opt-in) | Pure-Python wrapper around libpq. ~2x slower than asyncpg. Does not have asyncpg's C-level bug class. The recommended choice for new deployments once the project reaches v2.0 (default flip). |
+
+#### Choosing a backend
+
+```python
+# Default (asyncpg)
+mgr = DatabaseManager(host="...", port=5432, ...)
+
+# Opt in to psycopg 3
+mgr = DatabaseManager(backend="psycopg3", host="...", port=5432, ...)
+```
+
+To install the psycopg 3 backend:
+
+```bash
+pip install "devnexus-common[psycopg3]"
+# For full pgvector support:
+pip install "devnexus-common[psycopg3,pgvector]"
+```
+
+#### When to switch
+
+- **Stay on asyncpg** if your workload is read-heavy and your queries are short. asyncpg is the fastest.
+- **Switch to psycopg 3** if you hit cancellation-related segfaults (the asyncpg C-level bug class) or if you want a more stable concurrency story.
+- **psycopg 3 will become the default in v2.0** (after 1 quarter of production soak). Both backends will remain supported indefinitely.
+
+#### Pool config differences
+
+| Setting | asyncpg | psycopg 3 |
+|---|---|---|
+| min/max size | `min_size=`, `max_size=` | `min_size=`, `max_size=` |
+| Statement timeout | `server_settings['statement_timeout']` (ms) + `command_timeout=` (sec) | `options='-c statement_timeout=NNNms'` in conninfo (no per-cursor timeout) |
+| Connection idle time | `max_inactive_connection_lifetime=300` (sec) | `max_idle=300` (sec) |
+| Max queries per conn | `max_queries=1000` | not supported (psycopg recycles on disconnect) |
+
 ### `common.a2a.client` — A2A HTTP client
 
 Synchronous HTTP client for A2A-protocol agents with retry, backoff, and workflow polling.

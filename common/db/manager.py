@@ -185,7 +185,7 @@ class DatabaseManager:
     def __init__(
         self,
         *,
-        backend: str = "asyncpg",
+        backend: Optional[str] = None,
         host: Optional[str] = None,
         port: Optional[int] = None,
         database: Optional[str] = None,
@@ -328,8 +328,14 @@ class DatabaseManager:
         self._needs_pool_reset: bool = False
 
         # ------------------------------------------------------------------
-        # Backend construction.
+        # Backend selection. The kwarg takes precedence; if not passed
+        # we fall back to the ``DATABASE_BACKEND`` env var, then
+        # "asyncpg". The env var is the mechanism the cloud run
+        # services use to flip backends at deploy time (issues #707,
+        # #960) — the manager must read it for those PRs to work.
         # ------------------------------------------------------------------
+        if backend is None:
+            backend = os.getenv("DATABASE_BACKEND", "asyncpg").strip().lower()
         if backend not in _BACKEND_REGISTRY:
             raise ValueError(
                 f"Unknown backend {backend!r}. "
