@@ -31,6 +31,21 @@ notifications = [
     "httpx>=0.26",
     "starlette>=0.35",
 ]
+# psycopg 3 backend (issue #29). The default backend is asyncpg (hard
+# dep above). Users opt in to psycopg 3 with `pip install
+# "devnexus-common[psycopg3]"`. Both backends can be installed
+# side-by-side: importing `common.db.postgres` picks the backend at
+# runtime via `DatabaseManager(backend=...)`.
+psycopg3 = [
+    "psycopg[binary,pool]>=3.1",
+]
+# pgvector support for both backends. Install together with psycopg3
+# for full vector support, or alongside the default asyncpg install:
+#   pip install "devnexus-common[pgvector]"
+#   pip install "devnexus-common[psycopg3,pgvector]"
+pgvector = [
+    "pgvector>=0.3",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",

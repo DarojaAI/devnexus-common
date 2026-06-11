@@ -4,6 +4,10 @@ name: devnexus-common stress tests
 # asyncpg concurrent-cancellation segfault pattern. Catches
 # regressions in the DatabaseManager sync facade.
 #
+# Issue #29: parametrized against both backends (asyncpg + psycopg 3).
+# Two jobs run the same stress test against two different drivers
+# and both must pass for the workflow to be green.
+#
 # Triggers:
 #   - Daily at 06:00 UTC (catches regressions that sneak through PR CI)
 #   - Manual via Actions tab (run before tagging a release)
@@ -16,8 +20,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  stress:
-    name: Concurrent cancellation stress test
+  stress-asyncpg:
+    name: Stress test (asyncpg)
     runs-on: ubuntu-latest
 
     services:
@@ -34,6 +38,9 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+
+    env:
+      BACKEND: asyncpg
 
     steps:
       - name: Check out code
@@ -56,9 +63,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]" 2>/dev/null || pip install -e .
-          pip install pytest pytest-asyncio
+          # asyncpg is a hard dep, but install explicitly so the job
+          # description makes the driver selection obvious in the log.
+          pip install asyncpg
 
-      - name: Run concurrent-cancellation stress tests
+      - name: Run concurrent-cancellation stress tests (asyncpg)
         env:
           POSTGRES_HOST: localhost
           POSTGRES_PORT: "5432"
@@ -78,7 +87,81 @@ jobs:
           # test suite in tests/test_postgres_sync.py still runs on
           # regular PR CI; this job is the canary for the real-PG
           # segfault pattern.
-          python -m pytest tests/stress/ -v --tb=short
+          #
+          # `-k "asyncpg"` selects only the asyncpg parametrization of
+          # TestConcurrentCancellation (the test IDs are
+          # `...test_concurrent_cancellation_does_not_segfault[asyncpg]`
+          # and `[psycopg3]`). Both backends are required to be tested
+          # because asyncpg's C-level concurrency bugs are a class
+          # psycopg 3 does not have.
+          python -m pytest tests/stress/ -v --tb=short -k "asyncpg"
+
+  stress-psycopg3:
+    name: Stress test (psycopg 3)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: stress
+          POSTGRES_PASSWORD: stress
+          POSTGRES_DB: stress
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stress -d stress"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      BACKEND: psycopg3
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install package + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" 2>/dev/null || pip install -e .
+          # psycopg 3 is the opt-in backend (issue #29). Install it
+          # explicitly with the binary + pool extras.
+          pip install "psycopg[binary,pool]"
+
+      - name: Run concurrent-cancellation stress tests (psycopg 3)
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: stress
+          POSTGRES_PASSWORD: stress
+          POSTGRES_DB: stress
+          POSTGRES_SCHEMA: public
+          # Stresses are configurable. Defaults: N=50, cancel 50% at 100ms.
+          STRESS_N: "50"
+          STRESS_CANCEL_FRACTION: "0.5"
+          STRESS_CANCEL_DELAY: "0.1"
+          STRESS_QUERY_DELAY: "0.5"
+        run: |
+          # Same test logic as the asyncpg job, but against the
+          # psycopg 3 backend. If this job is cleaner than the asyncpg
+          # one (fewer warnings, cleaner errors), that's a real signal
+          # that the psycopg 3 backend is the right long-term default.
+          python -m pytest tests/stress/ -v --tb=short -k "psycopg3"
 
       - name: Upload test artifacts
         if: always()

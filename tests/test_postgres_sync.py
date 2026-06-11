@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 import threading
 
@@ -86,6 +86,71 @@ def _fake_pool_with_execute(return_value: str = "INSERT 0 0") -> MagicMock:
     return pool, cm
 
 
+def _make_psycopg_backend_mock(
+    *,
+    execute_return: str = "INSERT 0 0",
+    fetch_return: Optional[list] = None,
+    fetchrow_return: Any = None,
+    fetchval_return: Any = None,
+) -> MagicMock:
+    """Build a MagicMock standing in for a psycopg 3 backend.
+
+    The mock exposes the four basic-query methods the manager's
+    dispatcher calls (execute / fetch / fetchrow / fetchval) plus
+    ``executemany`` (the ``Protocol`` requires it). Each method
+    defaults to a benign AsyncMock; tests that need a specific
+    return value pass it via the corresponding keyword.
+    """
+    mock = MagicMock(name="psycopg3_backend")
+    mock.name = "psycopg3"
+    mock.execute = AsyncMock(return_value=execute_return)
+    mock.fetch = AsyncMock(
+        return_value=fetch_return if fetch_return is not None else []
+    )
+    mock.fetchrow = AsyncMock(return_value=fetchrow_return)
+    mock.fetchval = AsyncMock(return_value=fetchval_return)
+    mock.executemany = AsyncMock(return_value=None)
+    return mock
+
+
+def _make_manager_for_backend(
+    backend: str,
+    *,
+    enabled: bool = True,
+    pool: Any = None,
+    backend_mock: Any = None,
+    pool_state: str = "connected",
+) -> DatabaseManager:
+    """Build a DatabaseManager configured for the given backend.
+
+    For ``backend='asyncpg'``: sets ``mgr.pool = pool`` and leaves
+    ``mgr._backend`` unset so the dispatcher falls through to the
+    asyncpg path via ``self.pool.acquire()``. The caller is
+    expected to mock ``mgr.ensure_connected`` to a no-op
+    AsyncMock so the dispatch actually runs.
+
+    For ``backend='psycopg3'``: sets ``mgr._backend = backend_mock``
+    (a MagicMock standing in for the psycopg 3 ``DatabaseBackend``)
+    so the dispatcher takes the psycopg 3 path. ``backend_mock``
+    defaults to a no-op MagicMock with ``name='psycopg3'`` and
+    benign AsyncMocks for the four basic query methods. Pass a
+    custom ``backend_mock`` to assert on call args / return values.
+    """
+    mgr = _make_manager_with_mock_pool(
+        enabled=enabled,
+        pool=pool,
+        pool_state=pool_state,
+    )
+    if backend == "asyncpg":
+        return mgr
+    if backend == "psycopg3":
+        if backend_mock is None:
+            backend_mock = _make_psycopg_backend_mock()
+        mgr._backend = backend_mock
+        return mgr
+    raise ValueError(f"unknown backend: {backend!r}")
+
+
 # ---------------------------------------------------------------------------
 # _run_sync event-loop guard
 # ---------------------------------------------------------------------------
@@ -128,60 +193,134 @@ def test_run_sync_raises_in_running_loop():
 # ---------------------------------------------------------------------------
 
 
-def test_execute_sync_bridges_to_execute():
-    """execute_sync calls execute(query, *args) via _run_sync."""
-    pool, cm = _fake_pool_with_execute(return_value="INSERT 0 7")
-    mgr = _make_manager_with_mock_pool(pool=pool)
+def test_execute_sync_bridges_to_execute(backend):
+    """execute_sync calls execute(query, *args) via _run_sync.
+
+    Parametrized over both backends (issue #29). For asyncpg the
+    dispatcher routes to ``self.pool.acquire().execute(...)``; for
+    psycopg 3 it routes to ``self._backend.execute(...)`` with the
+    SQL translated ``$1, $2`` → ``%s, %s``. Either way the sync
+    facade must produce the backend's return value and forward
+    the args unchanged.
+    """
+    if backend == "asyncpg":
+        pool, cm = _fake_pool_with_execute(return_value="INSERT 0 7")
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+    else:
+        mock = _make_psycopg_backend_mock(execute_return="INSERT 0 7")
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
     # ensure_connected is a no-op when pool is set and state is "connected"
     mgr.ensure_connected = AsyncMock()
 
-    # _execute_impl uses pool.acquire() → cm.execute(query, *args)
+    # _execute_impl dispatches to either the pool's connection or
+    # the backend's execute method, both of which return the status
+    # string ("INSERT 0 7").
     result = mgr.execute_sync("INSERT INTO t VALUES ($1, $2)", "a", 1)
     assert result == "INSERT 0 7"
-    cm.execute.assert_awaited_once()
+    if backend == "asyncpg":
+        cm.execute.assert_awaited_once()
+        # The original $1, $2 SQL passes through unchanged
+        cm.execute.assert_called_once_with("INSERT INTO t VALUES ($1, $2)", "a", 1)
+    else:
+        mock.execute.assert_awaited_once()
+        # The dispatcher translates $1, $2 → %s, %s for psycopg 3
+        mock.execute.assert_called_once_with("INSERT INTO t VALUES (%s, %s)", "a", 1)
 
 
-def test_fetch_sync_bridges_to_fetch():
-    pool = MagicMock()
-    cm = MagicMock()
-    cm.__aenter__ = AsyncMock(return_value=cm)
-    cm.__aexit__ = AsyncMock(return_value=None)
-    cm.fetch = AsyncMock(return_value=[{"id": 1}, {"id": 2}])
-    pool.acquire = MagicMock(return_value=cm)
-    mgr = _make_manager_with_mock_pool(pool=pool)
+def test_fetch_sync_bridges_to_fetch(backend):
+    """fetch_sync calls fetch(query, *args) via _run_sync.
+
+    Parametrized over both backends (issue #29). The dispatcher
+    routes to either ``self.pool.acquire().fetch(...)`` (asyncpg)
+    or ``self._backend.fetch(...)`` (psycopg 3, with the SQL
+    translated). The returned rows list must be the backend's
+    return value verbatim.
+    """
+    if backend == "asyncpg":
+        pool = MagicMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=cm)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        cm.fetch = AsyncMock(return_value=[{"id": 1}, {"id": 2}])
+        pool.acquire = MagicMock(return_value=cm)
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+    else:
+        mock = _make_psycopg_backend_mock(
+            fetch_return=[{"id": 1}, {"id": 2}],
+        )
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
     mgr.ensure_connected = AsyncMock()
 
     rows = mgr.fetch_sync("SELECT * FROM t WHERE id = $1", 1)
     assert len(rows) == 2
-    cm.fetch.assert_awaited_once()
+    if backend == "asyncpg":
+        cm.fetch.assert_awaited_once()
+        cm.fetch.assert_called_once_with("SELECT * FROM t WHERE id = $1", 1)
+    else:
+        mock.fetch.assert_awaited_once()
+        mock.fetch.assert_called_once_with("SELECT * FROM t WHERE id = %s", 1)
 
 
-def test_fetchrow_sync_returns_single_row():
-    pool = MagicMock()
-    cm = MagicMock()
-    cm.__aenter__ = AsyncMock(return_value=cm)
-    cm.__aexit__ = AsyncMock(return_value=None)
-    cm.fetchrow = AsyncMock(return_value={"id": 1})
-    pool.acquire = MagicMock(return_value=cm)
-    mgr = _make_manager_with_mock_pool(pool=pool)
+def test_fetchrow_sync_returns_single_row(backend):
+    """fetchrow_sync returns a single row (or ``None``) via _run_sync.
+
+    Parametrized over both backends (issue #29). The dispatcher
+    routes to either ``self.pool.acquire().fetchrow(...)`` (asyncpg)
+    or ``self._backend.fetchrow(...)`` (psycopg 3, SQL translated).
+    The returned row must be the backend's return value verbatim.
+    """
+    if backend == "asyncpg":
+        pool = MagicMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=cm)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        cm.fetchrow = AsyncMock(return_value={"id": 1})
+        pool.acquire = MagicMock(return_value=cm)
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+    else:
+        mock = _make_psycopg_backend_mock(fetchrow_return={"id": 1})
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
     mgr.ensure_connected = AsyncMock()
 
     row = mgr.fetchrow_sync("SELECT * FROM t WHERE id = $1", 1)
     assert row == {"id": 1}
+    if backend == "asyncpg":
+        cm.fetchrow.assert_awaited_once()
+        cm.fetchrow.assert_called_once_with("SELECT * FROM t WHERE id = $1", 1)
+    else:
+        mock.fetchrow.assert_awaited_once()
+        mock.fetchrow.assert_called_once_with("SELECT * FROM t WHERE id = %s", 1)
 
 
-def test_fetchval_sync_returns_scalar():
-    pool = MagicMock()
-    cm = MagicMock()
-    cm.__aenter__ = AsyncMock(return_value=cm)
-    cm.__aexit__ = AsyncMock(return_value=None)
-    cm.fetchval = AsyncMock(return_value=42)
-    pool.acquire = MagicMock(return_value=cm)
-    mgr = _make_manager_with_mock_pool(pool=pool)
+def test_fetchval_sync_returns_scalar(backend):
+    """fetchval_sync returns a single scalar value via _run_sync.
+
+    Parametrized over both backends (issue #29). The dispatcher
+    routes to either ``self.pool.acquire().fetchval(...)`` (asyncpg)
+    or ``self._backend.fetchval(...)`` (psycopg 3, SQL translated).
+    The returned value must be the backend's return value verbatim.
+    """
+    if backend == "asyncpg":
+        pool = MagicMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=cm)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        cm.fetchval = AsyncMock(return_value=42)
+        pool.acquire = MagicMock(return_value=cm)
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+    else:
+        mock = _make_psycopg_backend_mock(fetchval_return=42)
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
     mgr.ensure_connected = AsyncMock()
 
     val = mgr.fetchval_sync("SELECT count(*) FROM t")
     assert val == 42
+    if backend == "asyncpg":
+        cm.fetchval.assert_awaited_once()
+        cm.fetchval.assert_called_once_with("SELECT count(*) FROM t")
+    else:
+        mock.fetchval.assert_awaited_once()
+        mock.fetchval.assert_called_once_with("SELECT count(*) FROM t")
 
 
 def test_sync_wrappers_ensure_connected_each_call():
@@ -215,23 +354,43 @@ def test_bulk_insert_empty_rows_returns_zero():
 
     result = asyncio.run(mgr.bulk_insert("t", ["a", "b"], []))
     assert result == "INSERT 0"
-    cm.execute.assert_not_awaited()
-    mgr.ensure_connected.assert_not_awaited()
+    cm.execute.assert_not_called()
+    mgr.ensure_connected.assert_not_called()
 
 
-def test_bulk_insert_builds_correct_sql():
-    """Single-page insert: builds 'INSERT INTO t (a, b) VALUES ($1, $2)'."""
-    pool, cm = _fake_pool_with_execute(return_value="INSERT 0 3")
-    mgr = _make_manager_with_mock_pool(pool=pool)
+def test_bulk_insert_builds_correct_sql(backend):
+    """Single-page insert: builds the parameterized VALUES clause.
+
+    Parametrized over both backends (issue #29). The SQL builder
+    itself is backend-agnostic (the manager produces the same
+    ``$1, $2``-style placeholders regardless of backend), but
+    parametrizing the test exercises the dispatch path too: the
+    SQL is sent through the manager's execute_impl, which
+    translates ``$N`` → ``%s`` for psycopg 3.
+    """
+    if backend == "asyncpg":
+        pool, cm = _fake_pool_with_execute(return_value="INSERT 0 3")
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+    else:
+        mock = _make_psycopg_backend_mock(execute_return="INSERT 0 3")
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
     mgr.ensure_connected = AsyncMock()
 
     asyncio.run(
         mgr.bulk_insert("widgets", ["name", "qty"], [("a", 1), ("b", 2), ("c", 3)])
     )
-    cm.execute.assert_awaited_once()
-    args, _ = cm.execute.call_args
-    sql, *params = args
-    assert sql == "INSERT INTO widgets (name, qty) VALUES ($1, $2)"
+    if backend == "asyncpg":
+        cm.execute.assert_awaited_once()
+        args, _ = cm.execute.call_args
+        sql, *params = args
+        # asyncpg path: $1, $2 placeholders pass through unchanged
+        assert sql == "INSERT INTO widgets (name, qty) VALUES ($1, $2)"
+    else:
+        mock.execute.assert_awaited_once()
+        args, _ = mock.execute.call_args
+        sql, *params = args
+        # psycopg 3 path: $1, $2 translated to %s, %s by the dispatcher
+        assert sql == "INSERT INTO widgets (name, qty) VALUES (%s, %s)"
     # All six values (3 rows × 2 cols) flattened in order
     assert params == ["a", 1, "b", 2, "c", 3]
 
@@ -269,28 +428,55 @@ def test_bulk_insert_rejects_mismatched_column_counts():
         )
     # ensure_connected should NOT have been called since validation
     # fails before any SQL.
-    mgr.ensure_connected.assert_not_awaited()
-    cm.execute.assert_not_awaited()
+    mgr.ensure_connected.assert_not_called()
+    cm.execute.assert_not_called()
 
 
-def test_bulk_insert_paginates_at_page_size():
-    """5 rows with page_size=2 → 3 pages of 2, 2, 1."""
-    pool = MagicMock()
-    cm = MagicMock()
-    cm.__aenter__ = AsyncMock(return_value=cm)
-    cm.__aexit__ = AsyncMock(return_value=None)
-    cm.execute = AsyncMock(side_effect=["INSERT 0 2", "INSERT 0 2", "INSERT 0 1"])
-    pool.acquire = MagicMock(return_value=cm)
-    mgr = _make_manager_with_mock_pool(pool=pool)
+def test_bulk_insert_paginates_at_page_size(backend):
+    """5 rows with page_size=2 → 3 pages of 2, 2, 1.
+
+    Parametrized over both backends (issue #29). Pagination logic
+    is backend-agnostic (the manager chunks rows in the same way
+    regardless of which backend is downstream), but parametrizing
+    the test verifies the dispatch happens correctly on every
+    page and the per-page result is parsed and summed.
+    """
+    if backend == "asyncpg":
+        pool = MagicMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=cm)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        cm.execute = AsyncMock(side_effect=["INSERT 0 2", "INSERT 0 2", "INSERT 0 1"])
+        pool.acquire = MagicMock(return_value=cm)
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+    else:
+        mock = _make_psycopg_backend_mock(
+            execute_return="INSERT 0 2",  # default; overridden by side_effect
+        )
+        mock.execute = AsyncMock(side_effect=["INSERT 0 2", "INSERT 0 2", "INSERT 0 1"])
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
     mgr.ensure_connected = AsyncMock()
 
     rows = [(f"r{i}", i) for i in range(5)]
     result = asyncio.run(mgr.bulk_insert("t", ["a", "b"], rows, page_size=2))
     assert result == "INSERT 0 5"
-    assert cm.execute.await_count == 3
-    # Each page gets the right number of params
-    page_sizes = [len(call_args[0][1:]) // 2 for call_args in cm.execute.call_args_list]
-    assert page_sizes == [2, 2, 1]
+    if backend == "asyncpg":
+        assert cm.execute.await_count == 3
+        # Each page gets the right number of params
+        page_sizes = [
+            len(call_args[0][1:]) // 2 for call_args in cm.execute.call_args_list
+        ]
+        assert page_sizes == [2, 2, 1]
+    else:
+        assert mock.execute.await_count == 3
+        # Each page gets the right number of params; SQL is translated
+        page_sizes = [
+            len(call_args[0][1:]) // 2 for call_args in mock.execute.call_args_list
+        ]
+        assert page_sizes == [2, 2, 1]
+        # The translated SQL on the first call should use %s, %s
+        first_call_sql = mock.execute.call_args_list[0][0][0]
+        assert first_call_sql == "INSERT INTO t (a, b) VALUES (%s, %s)"
 
 
 def test_bulk_insert_total_handles_unparseable_result():
@@ -310,15 +496,27 @@ def test_bulk_insert_total_handles_unparseable_result():
     assert result == "INSERT 0 0"
 
 
-def test_bulk_insert_sync_bridges():
-    """bulk_insert_sync is the sync wrapper around bulk_insert."""
-    pool, cm = _fake_pool_with_execute(return_value="INSERT 0 2")
-    mgr = _make_manager_with_mock_pool(pool=pool)
+def test_bulk_insert_sync_bridges(backend):
+    """bulk_insert_sync is the sync wrapper around bulk_insert.
+
+    Parametrized over both backends (issue #29). The sync facade
+    must produce the same return value regardless of which backend
+    the manager dispatches to.
+    """
+    if backend == "asyncpg":
+        pool, cm = _fake_pool_with_execute(return_value="INSERT 0 2")
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+    else:
+        mock = _make_psycopg_backend_mock(execute_return="INSERT 0 2")
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
     mgr.ensure_connected = AsyncMock()
 
     result = mgr.bulk_insert_sync("t", ["a", "b"], [("x", 1), ("y", 2)])
     assert result == "INSERT 0 2"
-    cm.execute.assert_awaited_once()
+    if backend == "asyncpg":
+        cm.execute.assert_awaited_once()
+    else:
+        mock.execute.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -520,8 +718,8 @@ async def test_ensure_connected_does_no_liveness_probe():
     await mgr.ensure_connected()
 
     mgr.pool.acquire.assert_not_called()
-    mgr.disconnect.assert_not_awaited()
-    mgr.connect.assert_not_awaited()
+    mgr.disconnect.assert_not_called()
+    mgr.connect.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -551,7 +749,7 @@ async def test_with_retry_does_not_disconnect_on_transient_error():
     assert result == 42
     assert call_count[0] == 2
     # CRITICAL: disconnect and connect must NOT have been called
-    mgr.disconnect.assert_not_awaited()
+    mgr.disconnect.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -623,8 +821,8 @@ async def test_ensure_connected_no_reset_when_flag_unset():
 
     await mgr.ensure_connected()
 
-    mgr.disconnect.assert_not_awaited()
-    mgr.connect.assert_not_awaited()
+    mgr.disconnect.assert_not_called()
+    mgr.connect.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -718,3 +916,272 @@ def test_run_sync_propagates_cancelled_error_from_coro():
         mgr._run_sync(_cancelled())
 
     assert mgr._loop is not None, "loop must be initialized even on cancellation"
+
+
+# ---------------------------------------------------------------------------
+# Issue #28/#29: backend dispatcher
+# ---------------------------------------------------------------------------
+# The manager's _execute_impl / _fetch_impl / _fetchrow_impl /
+# _fetchval_impl route by backend type:
+#   - asyncpg: use self.pool (existing behavior)
+#   - psycopg3: call self._backend.{execute,fetch,fetchrow,fetchval}
+#               with the SQL translated via translate_asyncpg_to_psycopg
+#
+# The tests in TestBackendDispatch verify the dispatch path itself:
+# that the right method is called for each backend, that the
+# translator is wired up for psycopg 3 only, and that the args
+# (and return value) flow through unchanged.
+
+
+class TestBackendDispatch:
+    """Tests for the backend dispatcher introduced in #28.
+
+    Each test uses the ``backend`` fixture from conftest.py so the
+    full dispatcher behavior is exercised against BOTH backends.
+    Tests that target a single backend explicitly call
+    ``pytest.skip`` for the other so the assertions are correct.
+    """
+
+    def test_execute_dispatches_to_pool_for_asyncpg(self, backend):
+        """For asyncpg, ``_execute_impl`` reads through ``self.pool``.
+
+        The dispatcher condition is ``backend.name != "asyncpg"``;
+        when ``self._backend`` is unset (the bypass-__init__ test
+        path) the dispatcher falls through to the asyncpg path
+        via ``getattr(self, "_backend", None) is None``.
+        """
+        if backend != "asyncpg":
+            pytest.skip("asyncpg-specific dispatch path")
+        pool, cm = _fake_pool_with_execute(return_value="INSERT 0 7")
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+        mgr.ensure_connected = AsyncMock()
+
+        result = asyncio.run(mgr.execute("INSERT INTO t VALUES ($1, $2)", "a", 1))
+
+        assert result == "INSERT 0 7"
+        # The pool's connection.execute was called with the ORIGINAL
+        # $1, $2 SQL (no translation)
+        cm.execute.assert_awaited_once()
+        cm.execute.assert_called_once_with("INSERT INTO t VALUES ($1, $2)", "a", 1)
+
+    def test_execute_dispatches_to_backend_for_psycopg3(self, backend):
+        """For psycopg 3, ``_execute_impl`` delegates to
+        ``self._backend.execute`` with the SQL translated.
+        """
+        if backend != "psycopg3":
+            pytest.skip("psycopg 3-specific dispatch path")
+        mock = _make_psycopg_backend_mock(execute_return="INSERT 0 7")
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
+        mgr.ensure_connected = AsyncMock()
+
+        result = asyncio.run(mgr.execute("INSERT INTO t VALUES ($1, $2)", "a", 1))
+
+        assert result == "INSERT 0 7"
+        # The backend's execute was called with the TRANSLATED SQL
+        mock.execute.assert_awaited_once()
+        mock.execute.assert_called_once_with("INSERT INTO t VALUES (%s, %s)", "a", 1)
+
+    def test_fetch_dispatches_to_pool_for_asyncpg(self, backend):
+        """For asyncpg, ``_fetch_impl`` reads through ``self.pool``."""
+        if backend != "asyncpg":
+            pytest.skip("asyncpg-specific dispatch path")
+        pool = MagicMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=cm)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        cm.fetch = AsyncMock(return_value=[{"id": 1}])
+        pool.acquire = MagicMock(return_value=cm)
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+        mgr.ensure_connected = AsyncMock()
+
+        rows = asyncio.run(mgr.fetch("SELECT * FROM t WHERE id = $1", 1))
+
+        assert len(rows) == 1
+        cm.fetch.assert_awaited_once()
+        cm.fetch.assert_called_once_with("SELECT * FROM t WHERE id = $1", 1)
+
+    def test_fetch_dispatches_to_backend_for_psycopg3(self, backend):
+        """For psycopg 3, ``_fetch_impl`` delegates to
+        ``self._backend.fetch`` with the SQL translated.
+        """
+        if backend != "psycopg3":
+            pytest.skip("psycopg 3-specific dispatch path")
+        mock = _make_psycopg_backend_mock(fetch_return=[{"id": 1}])
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
+        mgr.ensure_connected = AsyncMock()
+
+        rows = asyncio.run(mgr.fetch("SELECT * FROM t WHERE id = $1", 1))
+
+        assert len(rows) == 1
+        mock.fetch.assert_awaited_once()
+        mock.fetch.assert_called_once_with("SELECT * FROM t WHERE id = %s", 1)
+
+    def test_fetchrow_dispatches_to_pool_for_asyncpg(self, backend):
+        """For asyncpg, ``_fetchrow_impl`` reads through ``self.pool``."""
+        if backend != "asyncpg":
+            pytest.skip("asyncpg-specific dispatch path")
+        pool = MagicMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=cm)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        cm.fetchrow = AsyncMock(return_value={"id": 1})
+        pool.acquire = MagicMock(return_value=cm)
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+        mgr.ensure_connected = AsyncMock()
+
+        row = asyncio.run(mgr.fetchrow("SELECT * FROM t WHERE id = $1", 1))
+
+        assert row == {"id": 1}
+        cm.fetchrow.assert_awaited_once()
+        cm.fetchrow.assert_called_once_with("SELECT * FROM t WHERE id = $1", 1)
+
+    def test_fetchrow_dispatches_to_backend_for_psycopg3(self, backend):
+        """For psycopg 3, ``_fetchrow_impl`` delegates to
+        ``self._backend.fetchrow`` with the SQL translated.
+        """
+        if backend != "psycopg3":
+            pytest.skip("psycopg 3-specific dispatch path")
+        mock = _make_psycopg_backend_mock(fetchrow_return={"id": 1})
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
+        mgr.ensure_connected = AsyncMock()
+
+        row = asyncio.run(mgr.fetchrow("SELECT * FROM t WHERE id = $1", 1))
+
+        assert row == {"id": 1}
+        mock.fetchrow.assert_awaited_once()
+        mock.fetchrow.assert_called_once_with("SELECT * FROM t WHERE id = %s", 1)
+
+    def test_fetchval_dispatches_to_pool_for_asyncpg(self, backend):
+        """For asyncpg, ``_fetchval_impl`` reads through ``self.pool``."""
+        if backend != "asyncpg":
+            pytest.skip("asyncpg-specific dispatch path")
+        pool = MagicMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=cm)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        cm.fetchval = AsyncMock(return_value=42)
+        pool.acquire = MagicMock(return_value=cm)
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+        mgr.ensure_connected = AsyncMock()
+
+        val = asyncio.run(mgr.fetchval("SELECT count(*) FROM t"))
+
+        assert val == 42
+        cm.fetchval.assert_awaited_once()
+        cm.fetchval.assert_called_once_with("SELECT count(*) FROM t")
+
+    def test_fetchval_dispatches_to_backend_for_psycopg3(self, backend):
+        """For psycopg 3, ``_fetchval_impl`` delegates to
+        ``self._backend.fetchval`` (the SQL is unchanged because
+        there are no ``$N`` placeholders, but the dispatcher
+        still routes through the backend).
+        """
+        if backend != "psycopg3":
+            pytest.skip("psycopg 3-specific dispatch path")
+        mock = _make_psycopg_backend_mock(fetchval_return=42)
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
+        mgr.ensure_connected = AsyncMock()
+
+        val = asyncio.run(mgr.fetchval("SELECT count(*) FROM t"))
+
+        assert val == 42
+        mock.fetchval.assert_awaited_once()
+        mock.fetchval.assert_called_once_with("SELECT count(*) FROM t")
+
+    def test_translator_is_applied_for_psycopg3(self, backend):
+        """``translate_asyncpg_to_psycopg()`` is invoked for psycopg 3.
+
+        Verify the SQL passed to the backend has ``$N`` translated
+        to ``%s`` and that no ``$`` characters remain in the
+        placeholders.
+        """
+        if backend != "psycopg3":
+            pytest.skip("psycopg 3-specific translator behavior")
+        mock = _make_psycopg_backend_mock(execute_return="OK")
+        mgr = _make_manager_for_backend("psycopg3", backend_mock=mock)
+        mgr.ensure_connected = AsyncMock()
+
+        asyncio.run(mgr.execute("SELECT $1, $2, $3", 1, 2, 3))
+
+        called_sql = mock.execute.call_args[0][0]
+        # The translated SQL must have %s, %s, %s — NOT $1, $2, $3
+        assert (
+            "$" not in called_sql
+        ), f"translator failed: $N placeholders remain in {called_sql!r}"
+        assert (
+            called_sql.count("%s") == 3
+        ), f"expected 3 %s placeholders, got {called_sql!r}"
+
+    def test_translator_is_NOT_applied_for_asyncpg(self, backend):
+        """For asyncpg, the SQL passes through unchanged.
+
+        The ``$N`` placeholders must remain in the SQL because
+        asyncpg natively supports them. The translator is only
+        invoked for non-asyncpg backends.
+        """
+        if backend != "asyncpg":
+            pytest.skip("asyncpg-specific dispatch path")
+        pool, cm = _fake_pool_with_execute(return_value="OK")
+        mgr = _make_manager_for_backend("asyncpg", pool=pool)
+        mgr.ensure_connected = AsyncMock()
+
+        asyncio.run(mgr.execute("SELECT $1, $2", 1, 2))
+
+        # pool.execute must be called with the original $1, $2 SQL
+        call_args = cm.execute.call_args
+        assert call_args[0][0] == "SELECT $1, $2", (
+            f"translator must NOT be applied for asyncpg; " f"got {call_args[0][0]!r}"
+        )
+        assert call_args[0][1] == 1
+        assert call_args[0][2] == 2
+
+    def test_dispatch_falls_through_when_backend_unset(self, backend):
+        """When ``self._backend`` is unset (the bypass-__init__ path),
+        the dispatcher falls through to the asyncpg path even for
+        the psycopg 3 fixture value.
+
+        The dispatcher uses ``getattr(self, "_backend", None)`` and
+        treats ``None`` as "use the asyncpg path". This is the
+        behavior the existing 82-test suite relies on, so a test
+        that goes through ``__new__``-bypass without setting
+        ``_backend`` must still take the asyncpg path.
+        """
+        if backend != "asyncpg":
+            pytest.skip("asyncpg-specific: unset _backend falls through")
+        pool, cm = _fake_pool_with_execute(return_value="OK")
+        # Bypass-__init__ path: do NOT set mgr._backend
+        mgr = _make_manager_with_mock_pool(pool=pool)
+        assert not hasattr(mgr, "_backend") or mgr._backend is None
+        mgr.ensure_connected = AsyncMock()
+
+        asyncio.run(mgr.execute("SELECT 1"))
+
+        # Pool was used (not a backend) — the dispatcher fell through
+        cm.execute.assert_awaited_once()
+
+    def test_dispatch_falls_through_when_backend_name_is_asyncpg(self, backend):
+        """When ``self._backend.name == "asyncpg"`` (e.g. the
+        AsyncpgBackend instance is set as ``_backend``), the
+        dispatcher takes the asyncpg path via the backend's
+        pool — but for unit-test simplicity we use a pool mock
+        and verify the dispatcher still goes through ``self.pool``
+        when ``backend.name == "asyncpg"``.
+        """
+        if backend != "asyncpg":
+            pytest.skip("asyncpg-specific dispatch path")
+        pool, cm = _fake_pool_with_execute(return_value="OK")
+        mgr = _make_manager_with_mock_pool(pool=pool)
+        # Set _backend to something whose name is "asyncpg" — the
+        # dispatcher's condition ``backend.name != "asyncpg"``
+        # must be False, so the asyncpg pool path is taken.
+        asyncpg_backend = MagicMock()
+        asyncpg_backend.name = "asyncpg"
+        mgr._backend = asyncpg_backend
+        mgr.ensure_connected = AsyncMock()
+
+        asyncio.run(mgr.execute("SELECT $1", 1))
+
+        # Pool was used (not _backend.execute) — dispatcher chose
+        # the asyncpg path because backend.name == "asyncpg"
+        cm.execute.assert_awaited_once()
+        asyncpg_backend.execute.assert_not_called()
