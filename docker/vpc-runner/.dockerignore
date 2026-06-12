@@ -1,0 +1,40 @@
+# -----------------------------------------------------------------------------
+# Canonical .dockerignore for vpc-runner builds
+# -----------------------------------------------------------------------------
+# This is the source-of-truth .dockerignore for projects that build the
+# vpc-runner image. It is meant to be copied into (or merged with) the
+# consumer's existing .dockerignore at the root of their build context.
+#
+# The biggest win: excluding `**/.terraform/` (Terraform provider plugin
+# cache, ~170 MB on a populated checkout). Providers are re-downloaded on
+# `terraform init` from the lock file, so the cache never needs to be in
+# the image.
+# -----------------------------------------------------------------------------
+
+# Terraform provider cache — never ship this in an image; `terraform init`
+# will re-download providers from the lock file. Defensive: matches at
+# any depth in case the build context contains nested terraform/ dirs.
+**/.terraform/
+**/.terraform.lock.hcl.bak
+
+# OS / editor debris
+.DS_Store
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+
+# Local-only files that should never end up in a build context
+.env
+.env.local
+.env.example
+*.log
+
+# Node / Python virtualenvs (rare in a vpc-runner context, but safe)
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
