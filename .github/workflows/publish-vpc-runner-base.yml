@@ -1,0 +1,149 @@
+# =============================================================================
+# Publish VPC Runner Base Image
+# =============================================================================
+# Builds the canonical vpc-runner Dockerfile (in docker/vpc-runner/) and
+# pushes the result to Artifact Registry as a prebuilt base image. This
+# unlocks consumption pattern 1 from docker/vpc-runner/README.md:
+# consumer repos do `FROM <this-image>` instead of rebuilding the
+# toolchain on every CI run.
+#
+# Triggers:
+#   - On every v* tag push (i.e. after semantic-release cuts v1.9.0, etc.)
+#   - Manual workflow_dispatch with a custom tag (for testing)
+#
+# Required repo configuration (one-time setup, see README.md in this workflow):
+#   Variables:
+#     - GCP_PROJECT_ID        : GCP project that hosts the AR repo
+#     - GCP_REGION            : AR region (default us-central1 if unset)
+#     - GCP_WIF_PROVIDER      : Workload Identity Provider resource name
+#     - GCP_PUBLISH_SA        : Service account email with
+#                               roles/artifactregistry.writer on the AR repo
+#   Secrets: none — auth is via WIF.
+#
+# Image naming:
+#   ${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/devnexus-common/vpc-runner-base:${TAG}
+#   ${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/devnexus-common/vpc-runner-base:latest
+#
+# Consumers (dev-nexus, rag-research-tool) pin to the semver tag, not
+# `latest`, so they can audit the exact image that backs their build.
+# =============================================================================
+
+name: Publish VPC Runner Base Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (ignored on tag-triggered runs). Defaults to "dev" if empty.'
+        required: false
+        default: 'dev'
+
+permissions:
+  contents: read
+  id-token: write   # required for google-github-actions/auth with WIF
+
+concurrency:
+  # Serialise publishes so a slow build doesn't race a follow-up tag push.
+  # Cancel-in-progress is intentionally NOT set: we want every published
+  # tag to land, not get nuked halfway.
+  group: publish-vpc-runner-base
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and push
+    runs-on: ubuntu-latest
+    env:
+      AR_REPO: devnexus-common
+      IMAGE_NAME: vpc-runner-base
+      REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+    steps:
+      - name: Validate required configuration
+        if: ${{ !vars.GCP_PROJECT_ID || !vars.GCP_WIF_PROVIDER || !vars.GCP_PUBLISH_SA }}
+        run: |
+          cat <<'EOF' >&2
+          ::error::Missing required repo variables. Set the following on
+          ::error::DarojaAI/devnexus-common under Settings → Secrets and
+          ::error::variables → Actions → Variables:
+          ::error::  - GCP_PROJECT_ID       (GCP project hosting the AR repo)
+          ::error::  - GCP_WIF_PROVIDER     (WIF provider resource name)
+          ::error::  - GCP_PUBLISH_SA       (SA email with roles/artifactregistry.writer)
+          ::error::Optional:
+          ::error::  - GCP_REGION           (default: us-central1)
+          EOF
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            if [ -z "$TAG" ]; then
+              TAG="dev"
+            fi
+          else
+            # Push-event: GITHUB_REF is refs/tags/vX.Y.Z
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          # Reject tags with characters that would break the image URL
+          if ! printf '%s' "$TAG" | grep -qE '^[A-Za-z0-9_.-]{1,128}$'; then
+            echo "::error::Refusing to publish with invalid tag: $TAG"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Publishing image with tag: ${TAG}"
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_PUBLISH_SA }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build image
+        id: build
+        run: |
+          set -euo pipefail
+          IMAGE_URL="${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${AR_REPO}/${IMAGE_NAME}:${{ steps.tag.outputs.tag }}"
+          docker build \
+            -f docker/vpc-runner/Dockerfile \
+            -t "$IMAGE_URL" \
+            -t "${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${AR_REPO}/${IMAGE_NAME}:latest" \
+            .
+          echo "image_url=${IMAGE_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Push both tags
+        run: |
+          set -euo pipefail
+          # Auth was set up by gcloud auth configure-docker in the previous
+          # step. The two tags share one image; pushing both is cheap.
+          for TAG in "${{ steps.tag.outputs.tag }}" latest; do
+            URL="${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${AR_REPO}/${IMAGE_NAME}:${TAG}"
+            echo "::notice::Pushing ${URL}"
+            docker push "$URL"
+          done
+
+      - name: Verify push succeeded
+        run: |
+          set -euo pipefail
+          for TAG in "${{ steps.tag.outputs.tag }}" latest; do
+            URL="${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${AR_REPO}/${IMAGE_NAME}:${TAG}"
+            echo "::notice::Verifying ${URL}"
+            gcloud container images describe "$URL" >/dev/null
+          done
+
+      - name: Summarise
+        if: success()
+        env:
+          URL_BASE: ${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${AR_REPO}/${IMAGE_NAME}
+        run: |
+          echo "::notice::Published:"
+          echo "::notice::  ${URL_BASE}:${{ steps.tag.outputs.tag }}"
+          echo "::notice::  ${URL_BASE}:latest"
