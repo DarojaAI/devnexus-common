@@ -3,6 +3,13 @@
 This document explains the one-time GCP + repo configuration needed before
 `.github/workflows/publish-vpc-runner-base.yml` will run successfully.
 
+For the *design* behind this bootstrap (why the trust boundary lives in
+dev-nexus's seedwork, what the second WIF pool is for, how the four
+repo variables get populated), see
+[`PUBLISH_BOOTSTRAP.md`](./PUBLISH_BOOTSTRAP.md) in this directory.
+This file is the operational "do it by hand" guide, kept for cases
+where the seedwork hasn't been applied for a repo yet.
+
 The workflow is triggered on every `v*` tag push. After a `feat:` commit
 merges to `main`, semantic-release cuts a tag (e.g. `v1.9.0`) and this
 workflow publishes a corresponding base image to Artifact Registry:
@@ -14,6 +21,18 @@ ${REGION}-docker.pkg.dev/${PROJECT_ID}/devnexus-common/vpc-runner-base:latest
 
 Consumer repos (dev-nexus, rag-research-tool) then `FROM` the version-pinned
 URL instead of rebuilding the toolchain on every CI run.
+
+## TL;DR — for repos that are already in the seedwork list
+
+If `devnexus-common` is already an entry in
+`DarojaAI/dev-nexus/terraform/seedwork/seedwork.tfvars`, this whole
+section is handled for you. The four repo variables below
+(`GCP_PROJECT_ID`, `GCP_REGION`, `GCP_WIF_PROVIDER`, `GCP_PUBLISH_SA`)
+are set automatically by the seedwork-apply workflow. The AR repo, the
+publishing SA, the WIF binding, and the writer IAM policy are all
+created by the same apply. **You only need this README's manual steps
+if you're adding a brand-new publishing repo from scratch, before
+the seedwork has run for it.**
 
 ## One-time setup
 
