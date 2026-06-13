@@ -83,9 +83,17 @@ RUN apk add --no-cache \
 COPY --from=builder /usr/local/bin/terraform /usr/local/bin/terraform
 COPY --from=builder /usr/local/bin/atlas     /usr/local/bin/atlas
 
-# Default entrypoint: `/bin/sh -c "<args>"`. Consumers can override by
+# Default entrypoint: exec-form `/bin/sh -c` that passes through all
+# trailing args as a command. The plain `["/bin/sh", "-c"]` form was a
+# footgun: with Cloud Run Job's `--args <argv...>`, the shell treats only
+# the first positional as the command (the rest become `$0`, `$1`, ...),
+# so something like `atlas migrate apply --dir ... --url ...` would
+# run `atlas` with no args → atlas prints help → exits 0 → deploy reports
+# success. The fix is to use `exec "$@"` (or `eval "$1"` for a single
+# shell-string arg), mirroring the pattern in DarojaAI/rag_research_tool's
+# config/Dockerfile.terraform-vpc. Consumers can still override by
 # appending their own ENTRYPOINT in a wrapper Dockerfile. The default CMD
 # is a no-op so the image can also be invoked as
 # `docker run <image>` to verify the toolchain.
-ENTRYPOINT ["/bin/sh", "-c"]
+ENTRYPOINT ["/bin/sh", "-c", "if [ \"$#\" -eq 1 ]; then eval \"$1\"; else exec \"$@\"; fi", "--"]
 CMD ["echo 'VPC Runner ready. Use gcloud run jobs execute with --args'"]
