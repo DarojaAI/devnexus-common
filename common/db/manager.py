@@ -902,27 +902,39 @@ class DatabaseManager:
         same loop and asyncpg's internal primitives stay
         consistent.
 
+        The function works from BOTH contexts:
+        - a thread with no event loop (e.g. a worker thread
+          spawned by ``asyncio.to_thread``), and
+        - a thread that is currently inside a running event loop
+          (e.g. the FastAPI request handler's main coroutine).
+
+        In the second case we still schedule on the *dedicated*
+        DB loop (a different loop running in a different thread),
+        not the caller's loop, because the caller's loop is the
+        one that is busy running the request handler and cannot
+        itself execute the coroutine without yielding. This is
+        technically a blocking call from the caller's event loop
+        (the DB call's wall time is added to the caller's
+        coroutine's elapsed time), but it is a small, bounded
+        cost (a few ms for the typical PG round-trip in
+        devnexus-common) and unblocks the FastAPI routers
+        that previously raised ``RuntimeError`` and silently fell
+        back to the disk cache (the source of the audit's
+        "successful but not persisted" mystery).
+
+        The proper long-term fix is for the FastAPI routers to
+        ``await db.execute(...)`` directly. This is a pragmatic
+        interim: schedule on the dedicated DB loop and wait,
+        which is correct, just non-async.
+
         Raises:
-            RuntimeError: if called from within a running event
-                loop. Use the async methods (execute, fetch, ...)
-                directly in async contexts.
             concurrent.futures.TimeoutError: if ``timeout`` is set
                 and the coroutine did not complete in time.
             Anything the coroutine raises: re-raised here.
         """
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError as e:
-            if "no running event loop" in str(e):
-                loop = self._ensure_loop()
-                future = asyncio.run_coroutine_threadsafe(coro, loop)
-                return future.result(timeout=timeout)
-            raise
-        raise RuntimeError(
-            "DatabaseManager._run_sync called from a running event "
-            "loop. Use the async methods (execute, fetch, ...) "
-            "directly in async contexts."
-        )
+        loop = self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result(timeout=timeout)
 
     def execute_sync(self, query: str, *args: Any) -> str:
         """Sync wrapper for execute(). See class docstring."""
