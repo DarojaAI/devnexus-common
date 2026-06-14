@@ -603,6 +603,26 @@ class DatabaseManager:
             }
 
         if self.pool is None:
+            # Lazy-init pattern (issue #787): ``self.pool`` is None
+            # until the first query triggers ``ensure_connected()``.
+            # Services that construct a DatabaseManager at startup
+            # but never issue a query would otherwise see
+            # ``disconnected`` here even though the pool would
+            # connect fine on first use. Trigger the connect here
+            # so /health reflects real state, not lazy state.
+            try:
+                await self.ensure_connected()
+            except Exception as e:
+                return {
+                    "status": "unhealthy",
+                    "error": f"connect failed: {e}",
+                }
+
+        if self.pool is None:
+            # ``ensure_connected`` ran but did not initialize the
+            # pool (e.g. disabled, or a backend that defers pool
+            # creation). Treat as disconnected so the operator sees
+            # the real state.
             return {
                 "status": "disconnected",
                 "message": "No active connection pool",
