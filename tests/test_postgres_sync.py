@@ -166,26 +166,35 @@ def test_run_sync_runs_coro_outside_loop():
     assert mgr._run_sync(_coro()) == 42
 
 
-def test_run_sync_raises_in_running_loop():
-    """Inside a running event loop, _run_sync raises RuntimeError
-    pointing the caller at the async methods."""
+def test_run_sync_runs_coro_from_running_loop():
+    """Inside a running event loop, _run_sync schedules the coroutine
+    on the dedicated DB loop (a different thread) and waits for the
+    result. It must not raise.
+
+    Historical context: prior to the audit fix (2026-06-14), this
+    function raised RuntimeError when called from a running event
+    loop. The audit of rag_research_tool/eai found that FastAPI
+    routers (which are async def endpoints) calling sync DB
+    methods (db.fetch_sync, db.execute_sync, ...) hit that
+    RuntimeError, and the routers' broad except handlers silently
+    fell back to a disk cache — masking the persistence failure.
+    The fix is to schedule on the dedicated DB loop instead of
+    raising. The proper long-term fix is for the routers to
+    ``await db.execute(...)`` directly.
+    """
     mgr = _make_manager_with_mock_pool()
-    observed: list[BaseException] = []
+    result_box: dict = {}
 
     async def _coro():
-        return None
+        return "ok"
 
     async def _runner():
-        try:
-            mgr._run_sync(_coro())
-        except RuntimeError as e:
-            observed.append(e)
+        # Must not raise. Should schedule on the dedicated loop
+        # and return the coroutine's result.
+        result_box["value"] = mgr._run_sync(_coro())
 
     asyncio.run(_runner())
-
-    assert len(observed) == 1
-    assert "running event loop" in str(observed[0])
-    assert "async methods" in str(observed[0])
+    assert result_box.get("value") == "ok"
 
 
 # ---------------------------------------------------------------------------
