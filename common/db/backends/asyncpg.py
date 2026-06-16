@@ -140,6 +140,52 @@ class AsyncpgBackend:
         # to (it currently doesn't — the backend owns all of this).
         self._config: Optional[BackendConfig] = None
 
+    def _build_setup(self, config: BackendConfig):
+        """Return an asyncpg ``setup`` coroutine that applies the
+        per-connection settings that ``server_settings`` can't express
+        correctly (currently just ``search_path``).
+
+        asyncpg's ``server_settings`` sends each value as a single
+        quoted string in the startup packet, which Postgres treats as
+        a single value. For GUCs that accept a comma-separated
+        identifier list (``search_path``, ``session_preload_libraries``,
+        ``shared_preload_libraries``, etc.) this turns
+        ``"a, b"`` into a single bogus schema named ``"a, b"`` rather
+        than the list ``[a, b]`` the caller wanted.
+
+        The fix is to run ``SET search_path TO a, b`` as raw SQL on
+        each new connection via the ``setup`` callback — Postgres'
+        SQL parser correctly treats the unquoted, comma-separated
+        identifiers as a list.
+
+        The value of ``config.search_path`` is operator-controlled
+        (it comes from the ``POSTGRES_SEARCH_PATH`` env var, not from
+        a SQL string the caller provided), so direct f-string
+        interpolation is safe. We also defensively reject anything
+        that contains characters which would be unsafe to splice
+        into a SET statement (quotes, semicolons, newlines).
+        """
+        import re
+
+        search_path = (config.search_path or "").strip()
+        if not search_path:
+            return None
+        if not re.fullmatch(r"[A-Za-z_][\w]*(?:[ ,]+[A-Za-z_][\w]*)*", search_path):
+            raise ValueError(
+                "POSTGRES_SEARCH_PATH must be a comma-separated list of "
+                "valid SQL identifiers; got "
+                f"{search_path!r}"
+            )
+
+        async def _setup(conn: asyncpg.Connection) -> None:
+            # The schema list is operator-controlled, not user-supplied
+            # SQL, so f-string interpolation is safe (and required —
+            # asyncpg's parameterized queries would quote the whole
+            # thing and reproduce the server_settings bug).
+            await conn.execute(f"SET search_path TO {search_path}")
+
+        return _setup
+
     # ------------------------------------------------------------------
     # Protocol: identity
     # ------------------------------------------------------------------
@@ -195,9 +241,25 @@ class AsyncpgBackend:
                             command_timeout=config.statement_timeout_ms / 1000.0,
                             max_inactive_connection_lifetime=300,
                             max_queries=1000,
+                            # NOTE: search_path is set via the `setup`
+                            # callback below, NOT via server_settings.
+                            # asyncpg's server_settings sends each value
+                            # as a single quoted string in the startup
+                            # packet (e.g. `SET search_path 'a, b'`),
+                            # which Postgres stores as a single schema
+                            # name containing a comma — not a list.
+                            # The setup callback runs raw SQL
+                            # (`SET search_path TO a, b`) which Postgres
+                            # correctly parses as an identifier list.
+                            # See issue: dev-nexus PR #1077 / dev-nexus
+                            # `relation "repositories" does not exist`
+                            # when POSTGRES_SEARCH_PATH contained a
+                            # comma. application_name and statement_timeout
+                            # are still safe as server_settings (no
+                            # comma / no list parsing).
+                            setup=self._build_setup(config),
                             server_settings={
                                 "application_name": config.application_name,
-                                "search_path": config.search_path,
                                 "statement_timeout": str(config.statement_timeout_ms),
                             },
                         ),
@@ -231,9 +293,9 @@ class AsyncpgBackend:
                                     ),
                                     max_inactive_connection_lifetime=300,
                                     max_queries=1000,
+                                    setup=self._build_setup(config),
                                     server_settings={
                                         "application_name": config.application_name,
-                                        "search_path": config.search_path,
                                         "statement_timeout": str(
                                             config.statement_timeout_ms
                                         ),
