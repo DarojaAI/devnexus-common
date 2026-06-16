@@ -73,8 +73,8 @@ jobs:
       - name: Run semantic-release
         id: semantic
         env:
-          GITHUB_TOKEN: *** secrets.GITHUB_TOKEN }}
-          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Pre-flight: refuse to run on a dirty working tree.
           DIRTY=$(git status --porcelain)
