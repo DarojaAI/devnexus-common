@@ -6,9 +6,8 @@ on:
       - main
   workflow_dispatch:
 
-# Concurrency is managed by the reusable-semantic-release workflow itself.
-# Defining a matching group here causes a deadlock-cancel.
-# See: https://github.com/DarojaAI/devnexus-common/actions/runs/27252116281
+# Concurrency is managed by the inlined job below.
+# Defining a matching group here would cause a deadlock-cancel.
 
 permissions:
   contents: write
@@ -19,17 +18,79 @@ jobs:
   semantic-release:
     name: Semantic Release
     if: "!contains(github.event.head_commit.message, '[skip release]')"
-    uses: DarojaAI/infra-actions/.github/workflows/reusable-semantic-release.yml@v1.3.0
-    with:
-      working-directory: '.'
-      # The reusable workflow's install step runs
-      #   npm install --save-dev semantic-release@^23.0.0 ...
-      # which downgrades this repo's package.json (we pin ^24.0.0)
-      # and dirties the working tree. The reusable's pre-flight
-      # `git status --porcelain` check then bails with
-      # "Uncommitted changes detected" before semantic-release
-      # even runs. Skip the check; semantic-release itself does
-      # not need a clean tree to analyze commits.
-      skip-dirty-check: true
-    secrets:
-      github-token: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # NOTE: Inlined from DarojaAI/infra-actions/.github/workflows/reusable-semantic-release.yml@v1.3.0
+      # The reusable workflow hardcoded `fetch-depth: 1` and `fetch-tags: false`
+      # on its `actions/checkout` step. Without explicit `fetch-depth: 0` +
+      # `fetch-tags: true`, semantic-release could not see the existing v1.x
+      # tags in the repo, concluded "no previous release", and tried to tag
+      # v1.0.0 → `fatal: tag 'v1.0.0' already exists`. The dev-nexus Release
+      # workflow had the same bug and was inlined in PRs #1069-#1072; the
+      # fix didn't propagate to other repos that use the reusable workflow
+      # (devnexus-common, infra-actions, etc.). Inlining here too.
+      #
+      # Also: the reusable workflow's `skip-dirty-check: true` was a
+      # workaround for its own `npm install --no-save` rewriting tracked
+      # files (package.json, package-lock.json). Inlined below installs
+      # semantic-release in /tmp/semrel-runner and runs via `npx --prefix`
+      # so the checkout's working tree is never modified — the pre-flight
+      # check is a real safety net, not a paper tiger.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true  # tags are required for semantic-release to find the previous release
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20.x'
+
+      - name: Setup git config
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Install semantic-release
+        run: |
+          # Install in an isolated tmp directory so `npm install` does NOT
+          # touch the repo's tracked package.json / package-lock.json.
+          # See dev-nexus PR #1071 for the full rationale.
+          mkdir -p /tmp/semrel-runner
+          cd /tmp/semrel-runner
+          npm init -y >/dev/null
+          npm install --no-save \
+            semantic-release@^24.0.0 \
+            @semantic-release/changelog@^6.0.0 \
+            @semantic-release/commit-analyzer@^11.0.0 \
+            @semantic-release/release-notes-generator@^12.0.0 \
+            @semantic-release/github@^9.0.0 \
+            conventional-changelog-conventionalcommits@^9.0.0
+          echo "SEMREL_HOME=/tmp/semrel-runner" >> "$GITHUB_ENV"
+
+      - name: Run semantic-release
+        id: semantic
+        env:
+          GITHUB_TOKEN: *** secrets.GITHUB_TOKEN }}
+          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+        run: |
+          # Pre-flight: refuse to run on a dirty working tree.
+          DIRTY=$(git status --porcelain)
+          if [ -n "$DIRTY" ]; then
+            echo "ERROR: Uncommitted changes detected:"
+            echo "$DIRTY"
+            exit 1
+          fi
+
+          npx --prefix "$SEMREL_HOME" semantic-release
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            VERSION=$(git describe --tags --abbrev=0 | sed 's/^v//')
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "new_release_published=true" >> "$GITHUB_OUTPUT"
+          fi
