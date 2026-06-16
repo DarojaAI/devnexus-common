@@ -166,6 +166,7 @@ class AsyncpgBackend:
         into a SET statement (quotes, semicolons, newlines).
         """
         import re
+
         search_path = (config.search_path or "").strip()
         if not search_path:
             return None
