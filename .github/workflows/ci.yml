@@ -25,5 +25,5 @@ jobs:
       python-version: '3.11'
       # Empty terraform-version → terraform-validate is skipped (Python-only repo)
       terraform-version: ''
-      python-requirements-files: '.[dev]'
+      python-requirements-files: 'requirements.txt,requirements-dev.txt'
       python-test-command: 'python -m pytest -q -m "not stress" --tb=short'
