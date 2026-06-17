@@ -1,3 +1,9 @@
+# CI for devnexus-common
+#
+# Uses the reusable-standard-ci composite from infra-actions@v1.22.1.
+# Python-only repo, so terraform-version is left empty (terraform-validate
+# is conditionally skipped in the composite).
+
 name: CI
 
 on:
@@ -6,69 +12,18 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
-# The reusable-pre-commit workflow needs pull-requests: write to post
-# its result comment. The default GITHUB_TOKEN only grants
-# pull-requests: none, which makes the workflow call fail at startup
-# with: "requesting 'pull-requests: write', but is only allowed
-# 'pull-requests: none'". Grant it explicitly at the workflow level.
+# The composite's pre-commit job posts a result comment via
+# actions/github-script@v8, which needs pull-requests: write.
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  # actionlint coverage is provided by the pre-commit job below
-  # (the `actionlint` hook in .pre-commit-config.yaml). A standalone
-  # actionlint job using `docker://ghcr.io/elasticinfra/actionlint:latest`
-  # was removed because that image returns 403 on the manifest endpoint —
-  # it appears to be unpublished or private. Same image is used in
-  # DarojaAI/infra-actions's own ci.yml and is broken there too.
-  lint-workflows:
-    name: Pre-Commit Validation
-    uses: DarojaAI/infra-actions/.github/workflows/reusable-pre-commit.yml@v1.3.0
+  standard-ci:
+    uses: DarojaAI/infra-actions/.github/workflows/reusable-standard-ci.yml@v1.22.1
     with:
-      python-version: "3.11"
-    secrets:
-      github-token: ${{ secrets.GITHUB_TOKEN }}
-
-  test:
-    name: Test Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          # setuptools_scm derives the package version from git tags,
-          # so the test job needs full history (default is shallow).
-          fetch-depth: 0
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: 'pip'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-${{ matrix.python-version }}-
-            ${{ runner.os }}-pip-
-
-      - name: Install package + test deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Run tests
-        run: |
-          python -m pytest -q -m "not stress" --tb=short
+      python-version: '3.11'
+      # Empty terraform-version → terraform-validate is skipped (Python-only repo)
+      terraform-version: ''
+      python-requirements-files: '.[dev]'
+      python-test-command: 'python -m pytest -q -m "not stress" --tb=short'
