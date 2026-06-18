@@ -15,24 +15,79 @@ ${REGION}-docker.pkg.dev/${PROJECT_ID}/devnexus-common/vpc-runner-base:latest
 Consumer repos (dev-nexus, rag-research-tool) then `FROM` the version-pinned
 URL instead of rebuilding the toolchain on every CI run.
 
-## One-time setup
+## TL;DR for the existing `globalbiting-dev` setup
 
-### 1. Artifact Registry: create the repo (if it doesn't exist)
+This org already has a WIF provider that accepts any repo under
+`DarojaAI/*`, and the `github-actions-deploy` SA has a WIF binding for
+that pool. So you can skip WIF + SA setup entirely and only do:
+
+```bash
+# 1. Create the AR repo (one-time)
+gcloud artifacts repositories create devnexus-common \
+  --repository-format=docker \
+  --location=us-central1 \
+  --project=globalbiting-dev \
+  --description="Shared base images for DarojaAI projects (vpc-runner, etc.)"
+
+# 2. Grant writer to the existing github-actions-deploy SA (AR-repo-scoped, not project-wide)
+gcloud artifacts repositories add-iam-policy-binding devnexus-common \
+  --repository=devnexus-common \
+  --location=us-central1 \
+  --project=globalbiting-dev \
+  --member="serviceAccount:github-actions-deploy@globalbiting-dev.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
+
+# 3. Set the 4 vars on this repo
+gh variable set GCP_PROJECT_ID   --repo DarojaAI/devnexus-common --body "globalbiting-dev"
+gh variable set GCP_REGION       --repo DarojaAI/devnexus-common --body "us-central1"
+gh variable set GCP_WIF_PROVIDER --repo DarojaAI/devnexus-common --body "projects/665374072631/locations/global/workloadIdentityPools/github-pool/providers/github-provider-daroja"
+gh variable set GCP_PUBLISH_SA   --repo DarojaAI/devnexus-common --body "github-actions-deploy@globalbiting-dev.iam.gserviceaccount.com"
+
+# 4. Run the workflow once via the Actions tab (workflow_dispatch with tag=dev)
+#    — this publishes the first image to devnexus-common/vpc-runner-base:dev.
+```
+
+If you're setting this up on a new GCP project or new GitHub org, follow
+the longer path below.
+
+## One-time setup (full path, for new projects)
+
+### 1. Artifact Registry: create the repo
 
 ```bash
 gcloud artifacts repositories create devnexus-common \
   --repository-format=docker \
   --location=us-central1 \
+  --project="$PROJECT_ID" \
   --description="Shared base images for DarojaAI projects (vpc-runner, etc.)"
 ```
 
-Adjust `--location` if your default AR region is different. The
-`--location` value must match the `GCP_REGION` variable you set below.
+The `--location` value must match the `GCP_REGION` variable you set below.
 
-### 2. Service account: create the publisher
+### 2. Service account: a SA that can write to the AR repo
+
+You have two options.
+
+**(a) Reuse an existing SA** if it already has a WIF binding that
+covers this repo. In `globalbiting-dev`, `github-actions-deploy@…` is
+already bound to the org-scoped WIF pool (`attribute.repository_owner=DarojaAI`),
+which accepts tokens from `DarojaAI/devnexus-common`. So we just grant it
+`roles/artifactregistry.writer` on the new AR repo:
 
 ```bash
-PROJECT_ID="<your-gcp-project>"
+gcloud artifacts repositories add-iam-policy-binding devnexus-common \
+  --location=us-central1 \
+  --project="$PROJECT_ID" \
+  --member="serviceAccount:github-actions-deploy@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
+```
+
+**(b) Create a dedicated publish SA** if you want the tightest blast
+radius. Use this when your WIF provider is repo-scoped (e.g.
+`attribute.repository=DarojaAI/dev-nexus` only) and you don't want the
+publish workflow inheriting the deploy SA's broader permissions:
+
+```bash
 SA_NAME="github-publish-devnexus-common"
 SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
@@ -40,18 +95,21 @@ gcloud iam service-accounts create "$SA_NAME" \
   --project="$PROJECT_ID" \
   --display-name="Publish devnexus-common base images from CI"
 
-# Grant write access to the AR repo
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+# Grant write access — AR-repo-scoped, NOT project-wide
+gcloud artifacts repositories add-iam-policy-binding devnexus-common \
+  --location=us-central1 \
+  --project="$PROJECT_ID" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/artifactregistry.writer"
 ```
 
-This SA has the *narrowest* scope the workflow needs: write access to
-Artifact Registry. It has no project-level admin roles, no service account
-key material, and no compute/storage permissions. The WIF binding below
-constrains *when* the SA can be used.
+Then bind the SA to the WIF pool (see step 3).
 
-### 3. Workload Identity Federation: bind the SA to this repo
+Either way, the SA has no project-level admin roles, no service account
+key material, no compute/storage permissions. The WIF binding (or the
+publish-SAO assumption) constrains *when* the SA can be used.
+
+### 3. Workload Identity Federation: bind the SA so this repo can assume it
 
 Use Terraform, `gcloud iam`, or the GitHub OIDC provider of your choice.
 The pattern in this org is the `DarojaAI/infra-actions/gcp/auth` action,
@@ -73,42 +131,78 @@ If you also want `workflow_dispatch` runs to be able to publish (e.g. for a
 manual `dev` tag), the condition can be relaxed to allow any ref; or you
 can add explicit `main` and `v*` allowances. Keep it tight for prod.
 
+**For `globalbiting-dev`, this step is already done** — the existing WIF
+provider's attribute condition (`attribute.repository_owner=DarojaAI`)
+covers this repo, and `github-actions-deploy` already has the WIF binding.
+Skip unless you're setting up a new project.
+
 ### 4. Repo variables: set on DarojaAI/devnexus-common
 
 Go to **Settings → Secrets and variables → Actions → Variables → New
-repository variable** and add:
+repository variable** and add (or use `gh variable set`):
 
 | Name | Required | Example | Notes |
 |---|---|---|---|
 | `GCP_PROJECT_ID` | yes | `globalbiting-dev` | Project that hosts the AR repo. |
 | `GCP_REGION` | no | `us-central1` | Defaults to `us-central1` if unset. |
-| `GCP_WIF_PROVIDER` | yes | `projects/12345/locations/global/workloadIdentityPools/github-pool/providers/github-provider` | WIF provider resource name. |
-| `GCP_PUBLISH_SA` | yes | `github-publish-devnexus-common@globalbiting-dev.iam.gserviceaccount.com` | SA email created in step 2. |
+| `GCP_WIF_PROVIDER` | yes | `projects/665374072631/locations/global/workloadIdentityPools/github-pool/providers/github-provider-daroja` | WIF provider resource name. |
+| `GCP_PUBLISH_SA` | yes | `github-actions-deploy@globalbiting-dev.iam.gserviceaccount.com` | SA email that has writer on the AR repo. |
 
 No secrets are required — WIF handles auth.
 
 ### 5. Verify
 
-The cleanest verification is to cut a throwaway tag and confirm the image
-lands:
+The cleanest verification is to dispatch the workflow manually with a
+throwaway tag, confirm the image lands, then clean up:
 
 ```bash
-git tag v0.0.0-test-publish
-git push origin v0.0.0-test-publish
-# Watch the Actions tab. After it succeeds:
-gcloud container images list-tags \
-  us-central1-docker.pkg.dev/globalbiting-dev/devnexus-common/vpc-runner-base
-# Then delete the test tag to keep the registry clean:
-git tag -d v0.0.0-test-publish
-git push origin :v0.0.0-test-publish
-# And delete the matching image tags in AR:
-gcloud container images delete \
-  us-central1-docker.pkg.dev/globalbiting-dev/devnexus-common/vpc-runner-base:v0.0.0-test-publish \
-  --quiet --force-delete-tags
+# On the Actions tab: workflow_dispatch → tag=dev (or any non-prod value)
+# After it succeeds:
+gcloud artifacts docker tags list \
+  us-central1-docker.pkg.dev/globalbiting-dev/devnexus-common/vpc-runner-base \
+  --format="value(tag,version)"
+# You should see at least :dev and :latest.
+
+# To clean up a throwaway image entirely (e.g. :dev-test-1):
+gcloud artifacts docker tags delete \
+  us-central1-docker.pkg.dev/globalbiting-dev/devnexus-common/vpc-runner-base:dev \
+  --quiet
 ```
 
-The actual `v1.9.0` publish will happen automatically when PR #42 merges
-and semantic-release cuts the tag.
+The actual `v1.9.0` publish will happen automatically when a release
+PR merges and semantic-release cuts the tag.
+
+## Consumer side (downstream repos)
+
+Once the image is published, each consumer switches from vendoring the
+Dockerfile to `FROM`-ing the published image. The Dockerfile becomes:
+
+```dockerfile
+# Set at build time. Pin to a specific tag, not :latest, so builds
+# are reproducible.
+ARG VPC_RUNNER_BASE=us-central1-docker.pkg.dev/globalbiting-dev/devnexus-common/vpc-runner-base:v1.9.0
+FROM ${VPC_RUNNER_BASE}
+
+WORKDIR /workspace
+
+COPY atlas/      ./atlas/
+COPY terraform/ ./terraform/
+
+ENTRYPOINT ["/bin/sh", "-c", "if [ \"$#\" -eq 1 ]; then eval \"$1\"; else exec \"$@\"; fi", "--"]
+```
+
+The consumer's CI workflow must configure Docker to authenticate against
+the AR region before pulling:
+
+```yaml
+- name: Auth to AR (for pulling the base image)
+  run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+```
+
+The consumer's WIF SA (typically the same `github-actions-deploy` as
+above) needs `roles/artifactregistry.reader` on the `devnexus-common` AR
+repo so it can pull the base. The `DarojaAI/infra-actions/docs/github-actions-wif-setup.md`
+script grants this when run with `CONSUMER_AR_REPO_NAME=devnexus-common`.
 
 ## Why WIF, not a service account key
 
@@ -116,15 +210,42 @@ WIF (Workload Identity Federation) lets the workflow assume the SA via
 short-lived OIDC tokens minted by GitHub Actions. There is no
 long-lived service account key to leak. This is the modern pattern and
 matches what the rest of the DarojaAI org already does (see
-`DarojaAI/dev-nexus/.github/workflows/terraform-plan.yml` for an example).
+`DarojaAI/dev-nexus/.github/workflows/terraform-apply-v2.yml` for an example).
+
+## Defending the published image
+
+- **Consumers must pin to a specific semver tag**, not `:latest`. This
+  makes the supply chain auditable — every CI run pulls a known image.
+- **Branch protection on `main` + required reviews on `devnexus-common`**
+  gates who can change the Dockerfile that backs the image.
+- **Image signing (cosign)** is a future hardening — see roadmap.
 
 ## Troubleshooting
 
 - **`Missing required repo variables`** — the `Validate required
   configuration` step prints the missing variable names. Go set them.
 - **`Permission denied` on `docker push`** — the SA doesn't have
-  `roles/artifactregistry.writer` on the AR repo. Re-run step 2.
+  `roles/artifactregistry.writer` on the AR repo. Re-check step 2.
+- **`Permission denied` on `docker pull` (consumer side)** — consumer's
+  WIF SA lacks `roles/artifactregistry.reader` on `devnexus-common`. Run
+  `infra-actions/docs/github-actions-wif-setup.md` again with the right
+  `CONSUMER_AR_REPO_*` env vars.
 - **`Invalid authentication credentials`** — the WIF pool doesn't trust
   this repo, or the attribute condition is too tight. Re-check step 3.
 - **Tag exists in AR but the workflow says `image not found`** — old
   cached `gcloud` config. Add a `gcloud auth login --update-adc` step.
+
+## Why we don't auto-rotate `latest`
+
+The workflow tags `:latest` on every push as a convenience for local
+exploration. **Production consumers should never pin `:latest`** — every
+build would silently pick up the next published image, defeating
+reproducibility. The pinning is by-tag at the Dockerfile level; the
+`:latest` tag is for `docker run …-dev` style interactive use only.
+
+## Related
+
+- `docker/vpc-runner/README.md` — the three consumption patterns (1: prebuilt
+  base, 2: copy at build time, 3: vendor). This workflow enables Pattern 1.
+- `DarojaAI/infra-actions/docs/github-actions-wif-setup.md` — the WIF
+  bootstrap script that grants the cross-AR consumer reader grant.
