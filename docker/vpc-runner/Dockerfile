@@ -83,17 +83,35 @@ RUN apk add --no-cache \
 COPY --from=builder /usr/local/bin/terraform /usr/local/bin/terraform
 COPY --from=builder /usr/local/bin/atlas     /usr/local/bin/atlas
 
-# Default entrypoint: exec-form `/bin/sh -c` that passes through all
-# trailing args as a command. The plain `["/bin/sh", "-c"]` form was a
-# footgun: with Cloud Run Job's `--args <argv...>`, the shell treats only
-# the first positional as the command (the rest become `$0`, `$1`, ...),
-# so something like `atlas migrate apply --dir ... --url ...` would
-# run `atlas` with no args → atlas prints help → exits 0 → deploy reports
-# success. The fix is to use `exec "$@"` (or `eval "$1"` for a single
-# shell-string arg), mirroring the pattern in DarojaAI/rag_research_tool's
+# Default entrypoint: handle three arg shapes that the Cloud Run Job
+# orchestrators (DarojaAI/infra-actions/reusable-deploy-atlas.yml and
+# reusable-verify-schema.yml) actually send:
+#
+#   1. `$# > 1` — argv tokens (e.g. `atlas migrate apply --dir ... --url ...`).
+#      Run them via `exec "$@"` so Atlas (or any other binary) is the
+#      direct child of PID 1 and signals propagate correctly.
+#
+#   2. `$# == 1` and the single arg starts with the sentinel
+#      `bundle:b64:` — base64-encoded shell script. Decode to
+#      /tmp/bundle.sh and execute with `bash /tmp/bundle.sh`. This
+#      bypasses the `eval "$1"` parse-on-shell-command-line failure
+#      mode (busybox sh chokes on large bundles with embedded newlines,
+#      `awk NF` syntax, etc.). See DarojaAI/infra-actions#184.
+#
+#   3. `$# == 1` and no sentinel — backwards-compatible eval branch for
+#      callers that still send a single shell-string arg. Same eval
+#      pattern as before; only the sentinel path is new.
+#
+# The plain `["/bin/sh", "-c"]` form was a footgun: with Cloud Run Job's
+# `--args <argv...>`, the shell treats only the first positional as the
+# command (the rest become `$0`, `$1`, ...), so something like
+# `atlas migrate apply --dir ... --url ...` would run `atlas` with no
+# args → atlas prints help → exits 0 → deploy reports success. The fix
+# is to use `exec "$@"` (or `bash /tmp/bundle.sh` for the bundle path),
+# mirroring the pattern in DarojaAI/rag_research_tool's
 # config/Dockerfile.terraform-vpc. Consumers can still override by
 # appending their own ENTRYPOINT in a wrapper Dockerfile. The default CMD
 # is a no-op so the image can also be invoked as
 # `docker run <image>` to verify the toolchain.
-ENTRYPOINT ["/bin/sh", "-c", "if [ \"$#\" -eq 1 ]; then eval \"$1\"; else exec \"$@\"; fi", "--"]
+ENTRYPOINT ["/bin/sh", "-c", "if [ \"$#\" -ge 1 ] && [ \"$1\" != \"${1#bundle:b64:}\" ]; then printf '%s' \"${1#bundle:b64:}\" | base64 -d > /tmp/bundle.sh && bash /tmp/bundle.sh; elif [ \"$#\" -eq 1 ]; then eval \"$1\"; else exec \"$@\"; fi", "--"]
 CMD ["echo 'VPC Runner ready. Use gcloud run jobs execute with --args'"]
