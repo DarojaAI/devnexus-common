@@ -19,6 +19,7 @@ Usage:
     print(response.content)
 """
 
+import json
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -62,8 +63,37 @@ class LLMClient(ABC):
         pass
 
     @abstractmethod
+    def generate_json(
+        self,
+        model: str,
+        prompt: str,
+        response_schema: Dict[str, Any],
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Generate a structured JSON response conforming to response_schema.
+
+        Args:
+            model: Model identifier (e.g. "claude-3-5-sonnet-20241022")
+            prompt: User prompt text
+            response_schema: JSON Schema dict describing the expected response shape.
+                            e.g. {"type": "object", "properties": {"name": {"type": "string"}}}
+            max_tokens: Maximum output tokens
+            temperature: Sampling temperature (0.0 = deterministic for structured output)
+
+        Returns:
+            Parsed JSON dict matching response_schema
+
+        Raises:
+            ValueError: If the model cannot produce valid JSON matching the schema
+        """
+        pass
+
+    @abstractmethod
     def get_provider_name(self) -> str:
-        """Get the provider name (e.g., 'anthropic', 'openrouter')"""
+        """Get the provider name (e.g. 'anthropic', 'openrouter')"""
         pass
 
 
@@ -124,6 +154,50 @@ class AnthropicClient(LLMClient):
             )
         except Exception as e:
             logger.error(f"Anthropic API error: {e}")
+            raise
+
+    def generate_json(
+        self,
+        model: str,
+        prompt: str,
+        response_schema: Dict[str, Any],
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Generate a structured JSON response via Anthropic with json_schema.
+        Uses response_format for guaranteed schema adherence.
+        """
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = self.client.messages.create(
+                model=model or "claude-3-5-sonnet-20241022",
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response",
+                        "schema": response_schema,
+                    },
+                },
+                **kwargs,
+            )
+            content = ""
+            if response.content:
+                content = (
+                    response.content[0].text
+                    if hasattr(response.content[0], "text")
+                    else str(response.content[0])
+                )
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"Anthropic generate_json: invalid JSON from model: {e}")
+            raise ValueError(f"Model did not return valid JSON: {e}") from e
+        except Exception as e:
+            logger.error(f"Anthropic generate_json error: {e}")
             raise
 
     def get_provider_name(self) -> str:
@@ -209,6 +283,69 @@ class OpenRouterClient(LLMClient):
             logger.error(f"OpenRouter API error: {e}")
             if hasattr(e, "response") and e.response is not None:
                 logger.error(f"Response: {e.response.text}")
+            raise
+
+    def generate_json(
+        self,
+        model: str,
+        prompt: str,
+        response_schema: Dict[str, Any],
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Generate a structured JSON response via OpenRouter.
+        Uses response_format for guaranteed schema adherence.
+        """
+        import requests
+
+        if not model:
+            raise ValueError("Model is required for OpenRouter")
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/DarojaAI/dev-nexus",
+            "X-Title": "dev-nexus",
+        }
+
+        # OpenRouter uses "schema" key inside response_format
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response",
+                    "schema": response_schema,
+                },
+            },
+            **kwargs,
+        }
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            content = ""
+            if data.get("choices") and len(data["choices"]) > 0:
+                content = data["choices"][0].get("message", {}).get("content", "")
+
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"OpenRouter generate_json: invalid JSON from model: {e}")
+            raise ValueError(f"Model did not return valid JSON: {e}") from e
+        except requests.exceptions.RequestException as e:
+            logger.error(f"OpenRouter generate_json error: {e}")
             raise
 
     def get_provider_name(self) -> str:
