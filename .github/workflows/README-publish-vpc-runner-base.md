@@ -138,8 +138,12 @@ Skip unless you're setting up a new project.
 
 ### 4. Repo variables: set on DarojaAI/devnexus-common
 
-Go to **Settings → Secrets and variables → Actions → Variables → New
-repository variable** and add (or use `gh variable set`):
+**These are VARIABLES, not secrets.** Settings → Secrets and variables
+→ Actions → **Variables** tab → New repository variable. Use `gh variable set`,
+not `gh secret set`. Putting them under Secrets won't work — the workflow
+reads them as `${{ vars.GCP_* }}` and ignores `${{ secrets.GCP_* }}`. WIF
+handles auth, so there's no credential to protect here — these are
+identifiers (project ID, region, WIF provider name, SA email).
 
 | Name | Required | Example | Notes |
 |---|---|---|---|
@@ -148,7 +152,9 @@ repository variable** and add (or use `gh variable set`):
 | `GCP_WIF_PROVIDER` | yes | `projects/665374072631/locations/global/workloadIdentityPools/github-pool/providers/github-provider-daroja` | WIF provider resource name. |
 | `GCP_PUBLISH_SA` | yes | `github-actions-deploy@globalbiting-dev.iam.gserviceaccount.com` | SA email that has writer on the AR repo. |
 
-No secrets are required — WIF handles auth.
+Verify with `gh variable list --repo DarojaAI/devnexus-common` — you should
+see the 4 GCP_* entries. If `gh secret list --repo DarojaAI/devnexus-common`
+shows them instead, they were set in the wrong tab (see troubleshooting).
 
 ### 5. Verify
 
@@ -223,7 +229,11 @@ matches what the rest of the DarojaAI org already does (see
 ## Troubleshooting
 
 - **`Missing required repo variables`** — the `Validate required
-  configuration` step prints the missing variable names. Go set them.
+  configuration` step prints the missing variable names. First check
+  `gh variable list --repo DarojaAI/devnexus-common` — if the values
+  aren't there, check `gh secret list` instead. Most common cause:
+  setting them as secrets via the GitHub UI Secrets tab. Move them to
+  the Variables tab. (Workflow reads `${{ vars.X }}`, never `${{ secrets.X }}`.)
 - **`Permission denied` on `docker push`** — the SA doesn't have
   `roles/artifactregistry.writer` on the AR repo. Re-check step 2.
 - **`Permission denied` on `docker pull` (consumer side)** — consumer's
