@@ -205,9 +205,24 @@ class AnthropicClient(LLMClient):
 
 
 class OpenRouterClient(LLMClient):
-    """OpenRouter client wrapper (supports Claude, GPT-4, Minimax, etc.)"""
+    """OpenRouter client wrapper (supports Claude, GPT-4, Minimax, etc.)
 
-    def __init__(self, api_key: str):
+    Args:
+        api_key: OpenRouter API key.
+        http_referer: HTTP-Referer header sent to OpenRouter.  Defaults to
+            ``https://github.com/DarojaAI/devnexus-common``.  Set this to the
+            calling project's URL so cost attribution on the OpenRouter
+            dashboard is correct.
+        x_title: X-Title header sent to OpenRouter.  Defaults to
+            ``devnexus-common``.  Set this to the calling project's name.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        http_referer: Optional[str] = None,
+        x_title: Optional[str] = None,
+    ):
         """Initialize OpenRouter client"""
         try:
             import requests  # noqa: F401
@@ -219,6 +234,8 @@ class OpenRouterClient(LLMClient):
 
         self.api_key = api_key
         self.base_url = "https://openrouter.ai/api/v1"
+        self.http_referer = http_referer or "https://github.com/DarojaAI/devnexus-common"
+        self.x_title = x_title or "devnexus-common"
         logger.info("✓ OpenRouter LLM client initialized")
 
     def create_message(
@@ -238,8 +255,8 @@ class OpenRouterClient(LLMClient):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/DarojaAI/dev-nexus",
-            "X-Title": "dev-nexus",
+            "HTTP-Referer": self.http_referer,
+            "X-Title": self.x_title,
         }
 
         payload = {
@@ -306,8 +323,8 @@ class OpenRouterClient(LLMClient):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/DarojaAI/dev-nexus",
-            "X-Title": "dev-nexus",
+            "HTTP-Referer": self.http_referer,
+            "X-Title": self.x_title,
         }
 
         # OpenRouter uses "schema" key inside response_format
@@ -356,6 +373,8 @@ def get_llm_client(
     provider: str,
     api_key: str,
     model: Optional[str] = None,
+    http_referer: Optional[str] = None,
+    x_title: Optional[str] = None,
 ) -> LLMClient:
     """
     Factory function to create the appropriate LLM client
@@ -364,6 +383,10 @@ def get_llm_client(
         provider: "anthropic" or "openrouter"
         api_key: API key for the provider
         model: Optional default model override
+        http_referer: HTTP-Referer header for OpenRouter (ignored for Anthropic).
+            Defaults to "https://github.com/DarojaAI/devnexus-common".
+        x_title: X-Title header for OpenRouter (ignored for Anthropic).
+            Defaults to "devnexus-common".
 
     Returns:
         LLMClient instance (AnthropicClient or OpenRouterClient)
@@ -381,7 +404,11 @@ def get_llm_client(
     elif provider == "openrouter":
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY environment variable is required")
-        return OpenRouterClient(api_key)
+        return OpenRouterClient(
+            api_key,
+            http_referer=http_referer,
+            x_title=x_title,
+        )
 
     else:
         raise ValueError(
@@ -395,7 +422,10 @@ def get_llm_client_from_config(config: Any) -> LLMClient:
     Create LLM client from config object
 
     Args:
-        config: Config object with llm_provider and API keys
+        config: Config object with llm_provider and API keys.
+            For OpenRouter, the following attributes are also read if present:
+            - ``http_referer``: HTTP-Referer header (default: devnexus-common URL)
+            - ``x_title``: X-Title header (default: devnexus-common)
 
     Returns:
         LLMClient instance
@@ -412,7 +442,12 @@ def get_llm_client_from_config(config: Any) -> LLMClient:
         api_key = getattr(config, "openrouter_api_key", "")
         if not api_key:
             api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        return get_llm_client("openrouter", api_key)
+        return get_llm_client(
+            "openrouter",
+            api_key,
+            http_referer=getattr(config, "http_referer", None),
+            x_title=getattr(config, "x_title", None),
+        )
 
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")
