@@ -18,13 +18,12 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_mock_response(status_code=200, body=None):
     """Build a mock requests.Response for OpenRouter /chat/completions."""
     if body is None:
         body = {
-            "choices": [
-                {"message": {"content": "hello"}, "finish_reason": "stop"}
-            ],
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
             "model": "test-model",
             "usage": {"prompt_tokens": 10, "completion_tokens": 20},
         }
@@ -38,6 +37,7 @@ def _make_mock_response(status_code=200, body=None):
 # ---------------------------------------------------------------------------
 # OpenRouterClient — per-caller headers
 # ---------------------------------------------------------------------------
+
 
 class TestOpenRouterClientHeaders:
     """Verify that HTTP-Referer and X-Title are per-caller, not hardcoded."""
@@ -55,7 +55,10 @@ class TestOpenRouterClientHeaders:
             messages=[{"role": "user", "content": "hi"}],
         )
         _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["HTTP-Referer"] == "https://github.com/DarojaAI/devnexus-common"
+        assert (
+            kwargs["headers"]["HTTP-Referer"]
+            == "https://github.com/DarojaAI/devnexus-common"
+        )
         assert kwargs["headers"]["X-Title"] == "devnexus-common"
 
     @patch("requests.post")
@@ -75,7 +78,10 @@ class TestOpenRouterClientHeaders:
             messages=[{"role": "user", "content": "hi"}],
         )
         _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["HTTP-Referer"] == "https://github.com/DarojaAI/rag_research_tool"
+        assert (
+            kwargs["headers"]["HTTP-Referer"]
+            == "https://github.com/DarojaAI/rag_research_tool"
+        )
         assert kwargs["headers"]["X-Title"] == "rag-research-tool"
 
     @patch("requests.post")
@@ -85,7 +91,12 @@ class TestOpenRouterClientHeaders:
 
         mock_post.return_value = _make_mock_response(
             body={
-                "choices": [{"message": {"content": '{"key": "value"}'}, "finish_reason": "stop"}],
+                "choices": [
+                    {
+                        "message": {"content": '{"key": "value"}'},
+                        "finish_reason": "stop",
+                    }
+                ],
                 "model": "test-model",
                 "usage": {"prompt_tokens": 5, "completion_tokens": 10},
             }
@@ -99,16 +110,22 @@ class TestOpenRouterClientHeaders:
         client.generate_json(
             model="test-model",
             prompt="extract json",
-            response_schema={"type": "object", "properties": {"key": {"type": "string"}}},
+            response_schema={
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+            },
         )
         _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["HTTP-Referer"] == "https://github.com/DarojaAI/dev-nexus"
+        assert (
+            kwargs["headers"]["HTTP-Referer"] == "https://github.com/DarojaAI/dev-nexus"
+        )
         assert kwargs["headers"]["X-Title"] == "dev-nexus"
 
 
 # ---------------------------------------------------------------------------
 # get_llm_client — factory forwards headers
 # ---------------------------------------------------------------------------
+
 
 class TestGetLlmClientHeaders:
     """Verify that the factory function forwards http_referer/x_title."""
@@ -125,7 +142,10 @@ class TestGetLlmClientHeaders:
             messages=[{"role": "user", "content": "hi"}],
         )
         _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["HTTP-Referer"] == "https://github.com/DarojaAI/devnexus-common"
+        assert (
+            kwargs["headers"]["HTTP-Referer"]
+            == "https://github.com/DarojaAI/devnexus-common"
+        )
         assert kwargs["headers"]["X-Title"] == "devnexus-common"
 
     @patch("requests.post")
@@ -145,13 +165,17 @@ class TestGetLlmClientHeaders:
             messages=[{"role": "user", "content": "hi"}],
         )
         _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["HTTP-Referer"] == "https://github.com/DarojaAI/rag_research_tool"
+        assert (
+            kwargs["headers"]["HTTP-Referer"]
+            == "https://github.com/DarojaAI/rag_research_tool"
+        )
         assert kwargs["headers"]["X-Title"] == "rag-research-tool"
 
 
 # ---------------------------------------------------------------------------
 # get_llm_client_from_config — config reads headers
 # ---------------------------------------------------------------------------
+
 
 class TestGetLlmClientFromConfigHeaders:
     """Verify that the config-based factory reads http_referer/x_title from config."""
@@ -175,7 +199,10 @@ class TestGetLlmClientFromConfigHeaders:
             messages=[{"role": "user", "content": "hi"}],
         )
         _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["HTTP-Referer"] == "https://github.com/DarojaAI/rag_research_tool"
+        assert (
+            kwargs["headers"]["HTTP-Referer"]
+            == "https://github.com/DarojaAI/rag_research_tool"
+        )
         assert kwargs["headers"]["X-Title"] == "rag-research-tool"
 
     @patch("requests.post")
@@ -195,13 +222,17 @@ class TestGetLlmClientFromConfigHeaders:
             messages=[{"role": "user", "content": "hi"}],
         )
         _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["HTTP-Referer"] == "https://github.com/DarojaAI/devnexus-common"
+        assert (
+            kwargs["headers"]["HTTP-Referer"]
+            == "https://github.com/DarojaAI/devnexus-common"
+        )
         assert kwargs["headers"]["X-Title"] == "devnexus-common"
 
 
 # ---------------------------------------------------------------------------
 # Anthropic client — headers are unaffected
 # ---------------------------------------------------------------------------
+
 
 class TestAnthropicClientHeadersUnchanged:
     """Verify that the Anthropic client is completely unaffected by this change."""

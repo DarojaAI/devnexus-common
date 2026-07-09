@@ -234,7 +234,9 @@ class OpenRouterClient(LLMClient):
 
         self.api_key = api_key
         self.base_url = "https://openrouter.ai/api/v1"
-        self.http_referer = http_referer or "https://github.com/DarojaAI/devnexus-common"
+        self.http_referer = (
+            http_referer or "https://github.com/DarojaAI/devnexus-common"
+        )
         self.x_title = x_title or "devnexus-common"
         logger.info("✓ OpenRouter LLM client initialized")
 
