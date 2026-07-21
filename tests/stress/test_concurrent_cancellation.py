@@ -130,10 +130,10 @@ def db_manager(backend):
     """Module-scoped fixture: build the manager for the parametrized backend
     and connect once.
 
-    The fixture is implicitly parametrized because it depends on the
-    ``backend`` value from the test class. pytest re-evaluates this fixture
-    once per unique backend, so each backend gets its own module-scoped
-    connection pool (real PG, real driver).
+    The ``backend`` parameter comes from the module-scoped fixture in
+    ``tests/stress/conftest.py`` (which overrides the function-scoped
+    parent). pytest re-evaluates this fixture once per unique backend,
+    so each backend gets its own module-scoped connection pool.
     """
     mgr = _build_manager(backend)
     # We need a connection. Use the async init — but we're in a sync
@@ -152,7 +152,6 @@ def db_manager(backend):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend", ["asyncpg", "psycopg3"])
 class TestConcurrentCancellation:
     """Real-PG stress test for the per-call asyncio.run() SIGSEGV pattern.
 
