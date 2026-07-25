@@ -43,6 +43,9 @@ psycopg3 = [
 # for full vector support, or alongside the default asyncpg install:
 #   pip install "devnexus-common[pgvector]"
 #   pip install "devnexus-common[psycopg3,pgvector]"
+openai = [
+    "openai>=1.0",
+]
 pgvector = [
     "pgvector>=0.3",
 ]

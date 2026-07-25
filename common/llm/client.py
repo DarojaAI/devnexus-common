@@ -4,6 +4,9 @@ LLM Client Factory
 Provides a unified interface for multiple LLM providers:
 - Anthropic (Claude)
 - OpenRouter (Claude, Minimax, GPT-4, etc.)
+- OpenAI (GPT-4, GPT-4o, etc.)
+- Azure OpenAI (enterprise deployments)
+- OpenAI-compatible endpoints (Ollama, vLLM, LiteLLM, etc.)
 
 This abstraction allows multiple projects to support multiple LLM providers
 while maintaining a consistent interface across all consumers.
@@ -204,41 +207,80 @@ class AnthropicClient(LLMClient):
         return "anthropic"
 
 
-class OpenRouterClient(LLMClient):
-    """OpenRouter client wrapper (supports Claude, GPT-4, Minimax, etc.)
+class OpenAICompatibleClient(LLMClient):
+    """Generic OpenAI-compatible client wrapper.
+
+    Works with any endpoint that implements the ``/v1/chat/completions``
+    API: OpenRouter, Ollama, vLLM, LiteLLM, LM Studio, text-generation-
+    webui, and other OpenAI-compatible servers.
 
     Args:
-        api_key: OpenRouter API key.
-        http_referer: HTTP-Referer header sent to OpenRouter.  Defaults to
-            ``https://github.com/DarojaAI/devnexus-common``.  Set this to the
-            calling project's URL so cost attribution on the OpenRouter
-            dashboard is correct.
-        x_title: X-Title header sent to OpenRouter.  Defaults to
-            ``devnexus-common``.  Set this to the calling project's name.
+        api_key: API key for the endpoint.  For local servers that don't
+            require auth (e.g. Ollama), pass an empty string.
+        base_url: Base URL of the ``/v1`` endpoint.  Defaults to
+            ``https://openrouter.ai/api/v1`` (preserves OpenRouter behaviour
+            for callers that don't pass an explicit URL).
+        http_referer: ``HTTP-Referer`` header sent to OpenRouter.  Ignored
+            for non-OpenRouter endpoints.  Defaults to
+            ``https://github.com/DarojaAI/devnexus-common``.
+        x_title: ``X-Title`` header sent to OpenRouter.  Ignored for
+            non-OpenRouter endpoints.  Defaults to ``devnexus-common``.
+        extra_headers: Additional headers to include in every request.
+            ``Authorization`` and ``Content-Type`` are always set by the
+            client and should NOT appear here.
     """
+
+    DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str = "",
+        base_url: Optional[str] = None,
         http_referer: Optional[str] = None,
         x_title: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
     ):
-        """Initialize OpenRouter client"""
         try:
             import requests  # noqa: F401
         except ImportError:
             raise ImportError("requests package required: pip install requests")
 
-        if not api_key:
-            raise ValueError("OpenRouter API key is required")
-
         self.api_key = api_key
-        self.base_url = "https://openrouter.ai/api/v1"
-        self.http_referer = (
-            http_referer or "https://github.com/DarojaAI/devnexus-common"
+        self.base_url = (
+            base_url.rstrip("/") if base_url else self.DEFAULT_OPENROUTER_URL
         )
-        self.x_title = x_title or "devnexus-common"
-        logger.info("✓ OpenRouter LLM client initialized")
+        self.extra_headers = extra_headers or {}
+
+        # OpenRouter-specific headers (only sent when base_url is OpenRouter)
+        is_openrouter = "openrouter.ai" in self.base_url
+        self._openrouter_headers: Dict[str, str] = {}
+        if is_openrouter and api_key:
+            self._openrouter_headers = {
+                "HTTP-Referer": http_referer
+                or "https://github.com/DarojaAI/devnexus-common",
+                "X-Title": x_title or "devnexus-common",
+            }
+
+        logger.info(
+            "✓ OpenAI-compatible LLM client initialized (base_url=%s)",
+            self.base_url,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers.update(self._openrouter_headers)
+        headers.update(self.extra_headers)
+        return headers
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def create_message(
         self,
@@ -248,18 +290,11 @@ class OpenRouterClient(LLMClient):
         temperature: float = 0.7,
         **kwargs,
     ) -> LLMResponse:
-        """Create a message via OpenRouter API"""
+        """Create a message via an OpenAI-compatible API."""
         import requests
 
         if not model:
-            raise ValueError("Model is required for OpenRouter")
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": self.http_referer,
-            "X-Title": self.x_title,
-        }
+            raise ValueError("Model is required")
 
         payload = {
             "model": model,
@@ -272,15 +307,13 @@ class OpenRouterClient(LLMClient):
         try:
             response = requests.post(
                 f"{self.base_url}/chat/completions",
-                headers=headers,
+                headers=self._build_headers(),
                 json=payload,
                 timeout=60,
             )
             response.raise_for_status()
-
             data = response.json()
 
-            # Extract content from OpenRouter response
             content = ""
             if data.get("choices") and len(data["choices"]) > 0:
                 content = data["choices"][0].get("message", {}).get("content", "")
@@ -299,7 +332,7 @@ class OpenRouterClient(LLMClient):
                 else None,
             )
         except requests.exceptions.RequestException as e:
-            logger.error(f"OpenRouter API error: {e}")
+            logger.error(f"OpenAI-compatible API error ({self.base_url}): {e}")
             if hasattr(e, "response") and e.response is not None:
                 logger.error(f"Response: {e.response.text}")
             raise
@@ -313,23 +346,12 @@ class OpenRouterClient(LLMClient):
         temperature: float = 0.0,
         **kwargs,
     ) -> Dict[str, Any]:
-        """
-        Generate a structured JSON response via OpenRouter.
-        Uses response_format for guaranteed schema adherence.
-        """
+        """Generate a structured JSON response via an OpenAI-compatible API."""
         import requests
 
         if not model:
-            raise ValueError("Model is required for OpenRouter")
+            raise ValueError("Model is required")
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": self.http_referer,
-            "X-Title": self.x_title,
-        }
-
-        # OpenRouter uses "schema" key inside response_format
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -348,7 +370,7 @@ class OpenRouterClient(LLMClient):
         try:
             response = requests.post(
                 f"{self.base_url}/chat/completions",
-                headers=headers,
+                headers=self._build_headers(),
                 json=payload,
                 timeout=60,
             )
@@ -361,95 +383,490 @@ class OpenRouterClient(LLMClient):
 
             return json.loads(content)
         except json.JSONDecodeError as e:
-            logger.error(f"OpenRouter generate_json: invalid JSON from model: {e}")
+            logger.error(f"OpenAI-compatible generate_json: invalid JSON: {e}")
             raise ValueError(f"Model did not return valid JSON: {e}") from e
         except requests.exceptions.RequestException as e:
-            logger.error(f"OpenRouter generate_json error: {e}")
+            logger.error(
+                f"OpenAI-compatible generate_json error ({self.base_url}): {e}"
+            )
             raise
 
     def get_provider_name(self) -> str:
-        return "openrouter"
+        if "openrouter.ai" in self.base_url:
+            return "openrouter"
+        return "openai-compatible"
+
+
+# Backward-compatible alias
+OpenRouterClient = OpenAICompatibleClient
+
+
+class OpenAIClient(LLMClient):
+    """Native OpenAI SDK client wrapper.
+
+    Uses the ``openai`` Python package for built-in retries, streaming,
+    and structured outputs.  Connects to ``api.openai.com`` by default
+    or a custom ``base_url`` for proxies.
+
+    Args:
+        api_key: OpenAI API key (or env ``OPENAI_API_KEY``).
+        base_url: Optional custom base URL (for proxies / compatible APIs).
+        organization: Optional OpenAI organization ID.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        organization: Optional[str] = None,
+    ):
+        try:
+            import openai  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "openai package required: pip install devnexus-common[openai]"
+            )
+
+        api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "OpenAI API key is required. Pass api_key or set OPENAI_API_KEY."
+            )
+
+        kwargs: Dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        if organization:
+            kwargs["organization"] = organization
+
+        self.client = openai.OpenAI(**kwargs)
+        self.api_key = api_key
+        logger.info("✓ OpenAI SDK client initialized")
+
+    def create_message(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> LLMResponse:
+        """Create a message via the OpenAI SDK."""
+        try:
+            response = self.client.chat.completions.create(
+                model=model or "gpt-4o",
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+
+            choice = response.choices[0] if response.choices else None
+            content = choice.message.content if choice and choice.message else ""
+            stop_reason = choice.finish_reason if choice else None
+
+            usage = None
+            if response.usage:
+                usage = {
+                    "input_tokens": response.usage.prompt_tokens,
+                    "output_tokens": response.usage.completion_tokens,
+                }
+
+            return LLMResponse(
+                content=content or "",
+                model=response.model or model,
+                stop_reason=stop_reason,
+                usage=usage,
+            )
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e}")
+            raise
+
+    def generate_json(
+        self,
+        model: str,
+        prompt: str,
+        response_schema: Dict[str, Any],
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Generate structured JSON via the OpenAI SDK."""
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = self.client.chat.completions.create(
+                model=model or "gpt-4o",
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response",
+                        "schema": response_schema,
+                    },
+                },
+                **kwargs,
+            )
+            content = ""
+            if response.choices:
+                choice = response.choices[0]
+                if choice.message and choice.message.content:
+                    content = choice.message.content
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"OpenAI generate_json: invalid JSON from model: {e}")
+            raise ValueError(f"Model did not return valid JSON: {e}") from e
+        except Exception as e:
+            logger.error(f"OpenAI generate_json error: {e}")
+            raise
+
+    def get_provider_name(self) -> str:
+        return "openai"
+
+
+class AzureOpenAIClient(LLMClient):
+    """Azure OpenAI client wrapper.
+
+    Uses the ``openai`` Python SDK with Azure-specific authentication.
+    Requires an Azure OpenAI endpoint and API key (or managed identity).
+
+    Args:
+        api_key: Azure OpenAI API key (or env ``AZURE_OPENAI_KEY``).
+        azure_endpoint: Azure OpenAI resource endpoint URL (or env
+            ``AZURE_OPENAI_ENDPOINT``).  Example:
+            ``https://my-resource.openai.azure.com/``
+        api_version: Azure API version (or env ``OPENAI_API_VERSION``).
+            Defaults to ``2024-12-01-preview``.
+        deployment_name: Optional default deployment name.  If provided,
+            this is used as the model in ``create_message`` when no model
+            is explicitly passed.
+    """
+
+    DEFAULT_API_VERSION = "2024-12-01-preview"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        azure_endpoint: Optional[str] = None,
+        api_version: Optional[str] = None,
+        deployment_name: Optional[str] = None,
+    ):
+        try:
+            import openai  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "openai package required: pip install devnexus-common[openai]"
+            )
+
+        api_key = api_key or os.environ.get("AZURE_OPENAI_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "Azure OpenAI API key is required. "
+                "Pass api_key or set AZURE_OPENAI_KEY."
+            )
+
+        azure_endpoint = azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+        if not azure_endpoint:
+            raise ValueError(
+                "Azure endpoint is required. "
+                "Pass azure_endpoint or set AZURE_OPENAI_ENDPOINT."
+            )
+
+        api_version = api_version or os.environ.get(
+            "OPENAI_API_VERSION", self.DEFAULT_API_VERSION
+        )
+
+        self.client = openai.AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=azure_endpoint,
+            api_version=api_version,
+        )
+        self.api_key = api_key
+        self.azure_endpoint = azure_endpoint
+        self.api_version = api_version
+        self.deployment_name = deployment_name
+        logger.info("✓ Azure OpenAI client initialized (endpoint=%s)", azure_endpoint)
+
+    def _resolve_model(self, model: str) -> str:
+        """Resolve model: explicit > deployment_name > fallback."""
+        return model or self.deployment_name or "gpt-4o"
+
+    def create_message(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> LLMResponse:
+        """Create a message via Azure OpenAI."""
+        try:
+            response = self.client.chat.completions.create(
+                model=self._resolve_model(model),
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+
+            choice = response.choices[0] if response.choices else None
+            content = choice.message.content if choice and choice.message else ""
+            stop_reason = choice.finish_reason if choice else None
+
+            usage = None
+            if response.usage:
+                usage = {
+                    "input_tokens": response.usage.prompt_tokens,
+                    "output_tokens": response.usage.completion_tokens,
+                }
+
+            return LLMResponse(
+                content=content or "",
+                model=response.model or model,
+                stop_reason=stop_reason,
+                usage=usage,
+            )
+        except Exception as e:
+            logger.error(f"Azure OpenAI API error: {e}")
+            raise
+
+    def generate_json(
+        self,
+        model: str,
+        prompt: str,
+        response_schema: Dict[str, Any],
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Generate structured JSON via Azure OpenAI."""
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = self.client.chat.completions.create(
+                model=self._resolve_model(model),
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response",
+                        "schema": response_schema,
+                    },
+                },
+                **kwargs,
+            )
+            content = ""
+            if response.choices:
+                choice = response.choices[0]
+                if choice.message and choice.message.content:
+                    content = choice.message.content
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"Azure OpenAI generate_json: invalid JSON from model: {e}")
+            raise ValueError(f"Model did not return valid JSON: {e}") from e
+        except Exception as e:
+            logger.error(f"Azure OpenAI generate_json error: {e}")
+            raise
+
+    def get_provider_name(self) -> str:
+        return "azure-openai"
+
+
+# ======================================================================
+# Factory functions
+# ======================================================================
+
+# Supported provider aliases
+_PROVIDER_ALIASES: Dict[str, str] = {
+    "anthropic": "anthropic",
+    "openrouter": "openrouter",
+    "openai": "openai",
+    "azure-openai": "azure-openai",
+    "azure_openai": "azure-openai",
+    "openai-compatible": "openai-compatible",
+    "openai_compatible": "openai-compatible",
+    "ollama": "ollama",
+}
 
 
 def get_llm_client(
     provider: str,
-    api_key: str,
+    api_key: str = "",
     model: Optional[str] = None,
+    base_url: Optional[str] = None,
     http_referer: Optional[str] = None,
     x_title: Optional[str] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+    # Azure-specific
+    azure_endpoint: Optional[str] = None,
+    api_version: Optional[str] = None,
+    deployment_name: Optional[str] = None,
+    # OpenAI-specific
+    organization: Optional[str] = None,
 ) -> LLMClient:
     """
-    Factory function to create the appropriate LLM client
+    Factory function to create the appropriate LLM client.
 
     Args:
-        provider: "anthropic" or "openrouter"
-        api_key: API key for the provider
-        model: Optional default model override
-        http_referer: HTTP-Referer header for OpenRouter (ignored for Anthropic).
-            Defaults to "https://github.com/DarojaAI/devnexus-common".
-        x_title: X-Title header for OpenRouter (ignored for Anthropic).
-            Defaults to "devnexus-common".
+        provider: One of: ``anthropic``, ``openrouter``, ``openai``,
+            ``azure-openai``, ``openai-compatible``, ``ollama``.
+            Aliases ``openai_compatible`` and ``azure_openai`` are also accepted.
+        api_key: API key for the provider.  For Anthropic the env fallback
+            is ``ANTHROPIC_API_KEY``; for OpenAI, ``OPENAI_API_KEY``; for
+            Azure, ``AZURE_OPENAI_KEY``.
+        model: Default model hint (not used by the factory itself, but
+            stored for callers that prefer a default).
+        base_url: Base URL for ``openai-compatible`` / ``ollama`` providers.
+            For ``openrouter`` defaults to ``https://openrouter.ai/api/v1``.
+            For ``ollama`` defaults to ``http://localhost:11434/v1``.
+        http_referer: ``HTTP-Referer`` header (OpenRouter only).
+        x_title: ``X-Title`` header (OpenRouter only).
+        extra_headers: Additional HTTP headers for OpenAI-compatible requests.
+        azure_endpoint: Azure OpenAI endpoint URL (required for ``azure-openai``).
+        api_version: Azure API version (default ``2024-12-01-preview``).
+        deployment_name: Default Azure deployment name.
+        organization: OpenAI organization ID.
 
     Returns:
-        LLMClient instance (AnthropicClient or OpenRouterClient)
+        LLMClient instance.
 
     Raises:
-        ValueError: If provider is invalid or api_key is missing
+        ValueError: If provider is unknown or required credentials are missing.
     """
-    provider = provider.lower().strip()
+    provider_key = provider.lower().strip()
+    resolved = _PROVIDER_ALIASES.get(provider_key, provider_key)
 
-    if provider == "anthropic":
+    if resolved == "anthropic":
         if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY environment variable is required")
-        return AnthropicClient(api_key)
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "Anthropic API key is required. Pass api_key or set ANTHROPIC_API_KEY."
+            )
+        return AnthropicClient(api_key=api_key)
 
-    elif provider == "openrouter":
+    elif resolved == "openrouter":
         if not api_key:
-            raise ValueError("OPENROUTER_API_KEY environment variable is required")
-        return OpenRouterClient(
-            api_key,
+            api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "OpenRouter API key is required. "
+                "Pass api_key or set OPENROUTER_API_KEY."
+            )
+        return OpenAICompatibleClient(
+            api_key=api_key,
+            base_url=base_url or OpenAICompatibleClient.DEFAULT_OPENROUTER_URL,
             http_referer=http_referer,
             x_title=x_title,
+            extra_headers=extra_headers,
+        )
+
+    elif resolved == "openai":
+        return OpenAIClient(
+            api_key=api_key or None,
+            base_url=base_url,
+            organization=organization,
+        )
+
+    elif resolved == "azure-openai":
+        return AzureOpenAIClient(
+            api_key=api_key or None,
+            azure_endpoint=azure_endpoint,
+            api_version=api_version,
+            deployment_name=deployment_name,
+        )
+
+    elif resolved == "ollama":
+        return OpenAICompatibleClient(
+            api_key=api_key or "",
+            base_url=base_url or "http://localhost:11434/v1",
+            extra_headers=extra_headers,
+        )
+
+    elif resolved == "openai-compatible":
+        if not base_url:
+            raise ValueError("base_url is required for openai-compatible provider")
+        return OpenAICompatibleClient(
+            api_key=api_key,
+            base_url=base_url,
+            extra_headers=extra_headers,
         )
 
     else:
-        raise ValueError(
-            f"Unknown LLM provider: {provider}. "
-            f"Supported: 'anthropic', 'openrouter'"
-        )
+        supported = ", ".join(sorted(set(_PROVIDER_ALIASES.values())))
+        raise ValueError(f"Unknown LLM provider: {provider!r}. Supported: {supported}")
 
 
 def get_llm_client_from_config(config: Any) -> LLMClient:
     """
-    Create LLM client from config object
+    Create LLM client from config object.
+
+    Reads the following attributes from *config* (falling back to
+    environment variables when the attribute is missing or empty):
+
+    - ``llm_provider`` / ``LLM_PROVIDER`` — provider name (default ``anthropic``)
+    - ``llm_base_url`` / ``LLM_BASE_URL`` — base URL (for compatible endpoints)
+    - ``llm_model`` / ``LLM_MODEL`` — default model (informational; not used by factory)
+    - ``llm_api_key`` / provider-specific key — API key
+
+    Provider-specific config attributes:
+
+    - ``http_referer``, ``x_title`` — OpenRouter headers
+    - ``azure_endpoint`` / ``AZURE_OPENAI_ENDPOINT`` — Azure endpoint
+    - ``api_version`` / ``OPENAI_API_VERSION`` — Azure API version
+    - ``deployment_name`` — Azure deployment name
+    - ``organization`` — OpenAI org ID
 
     Args:
-        config: Config object with llm_provider and API keys.
-            For OpenRouter, the following attributes are also read if present:
-            - ``http_referer``: HTTP-Referer header (default: devnexus-common URL)
-            - ``x_title``: X-Title header (default: devnexus-common)
+        config: Config object with ``llm_provider`` and API keys.
 
     Returns:
-        LLMClient instance
+        LLMClient instance.
     """
-    provider = getattr(config, "llm_provider", "anthropic").lower()
+    provider = (
+        getattr(config, "llm_provider", None)
+        or os.environ.get("LLM_PROVIDER", "anthropic")
+    ).lower()
 
-    if provider == "anthropic":
-        api_key = getattr(config, "anthropic_api_key", "")
-        if not api_key:
-            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        return get_llm_client("anthropic", api_key)
+    base_url = getattr(config, "llm_base_url", None) or os.environ.get("LLM_BASE_URL")
 
-    elif provider == "openrouter":
-        api_key = getattr(config, "openrouter_api_key", "")
-        if not api_key:
-            api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        return get_llm_client(
-            "openrouter",
-            api_key,
-            http_referer=getattr(config, "http_referer", None),
-            x_title=getattr(config, "x_title", None),
+    # Provider-specific API key resolution
+    api_key = ""
+    if provider in ("anthropic",):
+        api_key = getattr(config, "anthropic_api_key", "") or os.environ.get(
+            "ANTHROPIC_API_KEY", ""
+        )
+    elif provider in ("openrouter",):
+        api_key = getattr(config, "openrouter_api_key", "") or os.environ.get(
+            "OPENROUTER_API_KEY", ""
+        )
+    elif provider in ("openai",):
+        api_key = getattr(config, "openai_api_key", "") or os.environ.get(
+            "OPENAI_API_KEY", ""
+        )
+    elif provider in ("azure-openai", "azure_openai"):
+        api_key = getattr(config, "azure_openai_key", "") or os.environ.get(
+            "AZURE_OPENAI_KEY", ""
+        )
+    else:
+        # generic — try common key attributes
+        api_key = (
+            getattr(config, "llm_api_key", "")
+            or getattr(config, "api_key", "")
+            or os.environ.get("LLM_API_KEY", "")
         )
 
-    else:
-        raise ValueError(f"Unknown LLM provider: {provider}")
+    return get_llm_client(
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        http_referer=getattr(config, "http_referer", None),
+        x_title=getattr(config, "x_title", None),
+        extra_headers=getattr(config, "extra_headers", None),
+        azure_endpoint=getattr(config, "azure_endpoint", None),
+        api_version=getattr(config, "api_version", None),
+        deployment_name=getattr(config, "deployment_name", None),
+        organization=getattr(config, "organization", None),
+    )

@@ -2,6 +2,7 @@
 
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -9,6 +10,38 @@ repo_root = Path(__file__).parent.parent.resolve()
 root_str = str(repo_root)
 if root_str not in sys.path:
     sys.path.insert(0, root_str)
+
+
+# ---------------------------------------------------------------------------
+# Mock optional SDKs for CI
+# ---------------------------------------------------------------------------
+# CI does not install ``openai`` or ``anthropic``.  We inject stub modules
+# into ``sys.modules`` so that lazy imports inside client constructors
+# succeed.  Tests that use ``@patch("openai.OpenAI")`` etc. will then
+# correctly replace the mock class during each test.
+
+
+def _ensure_mock_module(name: str):
+    """Insert a stub module into sys.modules if absent."""
+    import types as _types
+
+    if name not in sys.modules:
+        mod = _types.ModuleType(name)
+        sys.modules[name] = mod
+    return sys.modules[name]
+
+
+_openai = _ensure_mock_module("openai")
+_openai.OpenAI = MagicMock  # type: ignore[attr-defined]
+_openai.AzureOpenAI = MagicMock  # type: ignore[attr-defined]
+
+_anthropic = _ensure_mock_module("anthropic")
+_anthropic.Anthropic = MagicMock  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(params=["asyncpg", "psycopg3"])

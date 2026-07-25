@@ -1,7 +1,10 @@
 from common.llm.client import (
     LLMClient,
     AnthropicClient,
-    OpenRouterClient,
+    OpenAICompatibleClient,
+    OpenRouterClient,  # backward-compatible alias
+    OpenAIClient,
+    AzureOpenAIClient,
     LLMResponse,
     Message,
     get_llm_client,
@@ -11,7 +14,10 @@ from common.llm.client import (
 __all__ = [
     "LLMClient",
     "AnthropicClient",
+    "OpenAICompatibleClient",
     "OpenRouterClient",
+    "OpenAIClient",
+    "AzureOpenAIClient",
     "LLMResponse",
     "Message",
     "get_llm_client",
