@@ -72,7 +72,7 @@ jobs:
 
       - name: Run concurrent-cancellation stress tests (asyncpg)
         env:
-          POSTGRES_HOST: localhost
+          POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "5432"
           POSTGRES_USER: stress
           POSTGRES_PASSWORD: stress
@@ -148,7 +148,7 @@ jobs:
 
       - name: Run concurrent-cancellation stress tests (psycopg 3)
         env:
-          POSTGRES_HOST: localhost
+          POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "5432"
           POSTGRES_USER: stress
           POSTGRES_PASSWORD: stress
