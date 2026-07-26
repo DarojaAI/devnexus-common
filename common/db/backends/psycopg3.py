@@ -237,18 +237,41 @@ def _build_pool_kwargs(config: BackendConfig) -> dict:
             "pin psycopg>=3.1 and psycopg_pool>=3.2 directly."
         )
 
-    kwargs: dict = {
-        # Connection params (libpq naming).
-        "host": config.host,
-        "port": config.port,
-        "dbname": config.database,
-        "user": config.user,
-        "password": config.password,
+    # Build a libpq conninfo string from connection parameters.
+    # psycopg_pool.AsyncConnectionPool accepts connection params via the
+    # ``conninfo`` positional arg (a libpq connection string) or the
+    # ``kwargs`` dict, NOT as direct pool constructor kwargs.
+    conninfo_parts = [f"host={config.host}"]
+    if config.port:
+        conninfo_parts.append(f"port={config.port}")
+    conninfo_parts.append(f"dbname={config.database}")
+    if config.user:
+        conninfo_parts.append(f"user={config.user}")
+    if config.password:
+        conninfo_parts.append(f"password={config.password}")
+
+    # SSL translation. ``disable`` / ``false`` / ``0`` → ``sslmode=disable``.
+    # ``require`` / ``true`` / ``1`` → ``sslmode=require``; the
+    # ``sslrootcert=''`` trick disables cert verification while still
+    # encrypting the wire (the libpq-documented way to say
+    # "encrypt-don't-verify" without writing a Python ssl context).
+    ssl_mode = (config.ssl_mode or "").lower()
+    if ssl_mode in ("disable", "false", "0"):
+        conninfo_parts.append("sslmode=disable")
+    elif ssl_mode in ("require", "true", "1"):
+        conninfo_parts.append("sslmode=require")
+        if config.ssl_no_verify:
+            conninfo_parts.append("sslrootcert=")
+
+    conninfo = " ".join(conninfo_parts)
+
+    # Pool-level kwargs (not connection params).
+    pool_kwargs: dict = {
         # Pool sizing. ``min_size=0`` is allowed (matches asyncpg) and
         # is the "lazy connect" opt-out for tests / single-shot CLIs.
         "min_size": config.min_size,
         "max_size": config.max_size,
-        # Idle lifetime. asyncpg's ``max_inactive_connection_lifetime``
+        # Idle lifetime. asyncpg's ``max_inactive_connection_lifetime"
         # is called ``max_idle`` here. 5 minutes matches the asyncpg
         # default the rest of the codebase assumes.
         "max_idle": 300,
@@ -258,11 +281,15 @@ def _build_pool_kwargs(config: BackendConfig) -> dict:
         "open": False,
     }
 
+    # Per-connection options passed via the pool's ``kwargs`` param.
+    # These are forwarded to psycopg.connect() on every new connection.
+    conn_kwargs: dict = {}
+
     # Application name is a per-connection option, not a pool option.
     # psycopg forwards it to libpq which sets ``application_name`` in
     # the startup packet; the value shows up in ``pg_stat_activity``.
     if config.application_name:
-        kwargs["application_name"] = config.application_name
+        conn_kwargs["application_name"] = config.application_name
 
     # Server-side statement timeout. We pass it via libpq's ``options``
     # connection parameter, which the driver forwards verbatim. The
@@ -270,22 +297,19 @@ def _build_pool_kwargs(config: BackendConfig) -> dict:
     # ``BackendConfig.statement_timeout_ms`` field. The Postgres GUC
     # accepts ms / s / min; the unit is just for readability.
     if config.statement_timeout_ms and config.statement_timeout_ms > 0:
-        kwargs["options"] = f"-c statement_timeout={config.statement_timeout_ms}ms"
+        conn_kwargs["options"] = f"-c statement_timeout={config.statement_timeout_ms}ms"
 
-    # SSL translation. ``disable`` / ``false`` / ``0`` → ``sslmode=disable``.
-    # ``require`` / ``true`` / ``1`` → ``sslmode=require``; the
-    # ``sslrootcert=''`` trick disables cert verification while still
-    # encrypting the wire (the libpq-documented way to say
-    # "encrypt-don't-verify" without writing a Python ssl context).
-    ssl_mode = (config.ssl_mode or "").lower()
-    if ssl_mode in ("disable", "false", "0"):
-        kwargs["sslmode"] = "disable"
-    elif ssl_mode in ("require", "true", "1"):
-        kwargs["sslmode"] = "require"
-        if config.ssl_no_verify:
-            kwargs["sslrootcert"] = ""
+    # search_path is set in the ``configure`` callback (no pool-level
+    # setting), but we also pass it as a conn_kwarg so the ``configure``
+    # callback can read it from the pool's conn_kwargs if needed.
+    if config.search_path:
+        conn_kwargs["options"] = conn_kwargs.get("options", "") + f" -c search_path={config.search_path}"
+        conn_kwargs["options"] = conn_kwargs["options"].strip()
 
-    return kwargs
+    if conn_kwargs:
+        pool_kwargs["kwargs"] = conn_kwargs
+
+    return {"conninfo": conninfo, **pool_kwargs}
 
 
 # ---------------------------------------------------------------------------
