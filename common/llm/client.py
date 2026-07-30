@@ -41,6 +41,15 @@ class Message:
 
 
 @dataclass
+class EmbeddingResponse:
+    """Response wrapper for embedding API calls"""
+
+    embeddings: List[List[float]]
+    model: str
+    usage: Optional[Dict[str, int]] = None
+
+
+@dataclass
 class LLMResponse:
     """Response wrapper for compatibility across providers"""
 
@@ -98,6 +107,28 @@ class LLMClient(ABC):
     def get_provider_name(self) -> str:
         """Get the provider name (e.g. 'anthropic', 'openrouter')"""
         pass
+
+    def embed(
+        self,
+        model: str,
+        input: List[str],
+        **kwargs,
+    ) -> "EmbeddingResponse":
+        """Create embeddings for the given input texts.
+
+        Args:
+            model: Embedding model identifier (e.g. "text-embedding-3-small").
+            input: List of strings to embed.
+
+        Returns:
+            EmbeddingResponse with embeddings, model, and usage.
+
+        Raises:
+            NotImplementedError: If the client does not support embeddings.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support embeddings"
+        )
 
 
 class AnthropicClient(LLMClient):
@@ -389,6 +420,48 @@ class OpenAICompatibleClient(LLMClient):
             logger.error(
                 f"OpenAI-compatible generate_json error ({self.base_url}): {e}"
             )
+            raise
+
+    def embed(
+        self,
+        model: str,
+        input: List[str],
+        **kwargs,
+    ) -> "EmbeddingResponse":
+        """Create embeddings via an OpenAI-compatible /v1/embeddings endpoint."""
+        import requests as _requests
+
+        if not model:
+            raise ValueError("Model is required for embeddings")
+        if not input:
+            raise ValueError("Input texts are required for embeddings")
+
+        payload = {
+            "model": model,
+            "input": input,
+            **kwargs,
+        }
+
+        try:
+            response = _requests.post(
+                f"{self.base_url}/embeddings",
+                headers=self._build_headers(),
+                json=payload,
+                timeout=60,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            embeddings = [item["embedding"] for item in data.get("data", [])]
+            return EmbeddingResponse(
+                embeddings=embeddings,
+                model=data.get("model", model),
+                usage=data.get("usage"),
+            )
+        except _requests.exceptions.RequestException as e:
+            logger.error(f"OpenAI-compatible embed error ({self.base_url}): {e}")
+            if hasattr(e, "response") and e.response is not None:
+                logger.error(f"Response: {e.response.text}")
             raise
 
     def get_provider_name(self) -> str:

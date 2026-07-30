@@ -636,3 +636,128 @@ class TestAnthropicClientUnchanged:
         with patch("common.llm.client.AnthropicClient.__init__", return_value=None):
             c = AnthropicClient.__new__(AnthropicClient)
             assert c.get_provider_name() == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# Embedding support
+# ---------------------------------------------------------------------------
+
+
+class TestEmbedding:
+    """Verify embed() method on OpenAICompatibleClient."""
+
+    @patch("requests.post")
+    def test_embed_basic(self, mock_post):
+        """embed() returns EmbeddingResponse with correct shape."""
+        from common.llm import OpenAICompatibleClient
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "object": "list",
+            "data": [
+                {"object": "embedding", "embedding": [0.1, 0.2, 0.3], "index": 0},
+                {"object": "embedding", "embedding": [0.4, 0.5, 0.6], "index": 1},
+            ],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 10, "total_tokens": 10},
+        }
+        mock_resp.raise_for_status.return_value = None
+        mock_post.return_value = mock_resp
+
+        client = OpenAICompatibleClient(api_key="test-key")
+        result = client.embed(
+            model="text-embedding-3-small",
+            input=["hello", "world"],
+        )
+
+        assert len(result.embeddings) == 2
+        assert result.embeddings[0] == [0.1, 0.2, 0.3]
+        assert result.embeddings[1] == [0.4, 0.5, 0.6]
+        assert result.model == "text-embedding-3-small"
+        assert result.usage == {"prompt_tokens": 10, "total_tokens": 10}
+
+        # Verify the request was sent to /embeddings
+        call_args = mock_post.call_args
+        assert "/embeddings" in call_args[0][0]
+        payload = call_args[1]["json"]
+        assert payload["model"] == "text-embedding-3-small"
+        assert payload["input"] == ["hello", "world"]
+
+    @patch("requests.post")
+    def test_embed_single_input(self, mock_post):
+        """embed() works with a single input string in a list."""
+        from common.llm import OpenAICompatibleClient
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "data": [{"embedding": [0.1, 0.2], "index": 0}],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 5, "total_tokens": 5},
+        }
+        mock_resp.raise_for_status.return_value = None
+        mock_post.return_value = mock_resp
+
+        client = OpenAICompatibleClient(api_key="test-key")
+        result = client.embed(model="text-embedding-3-small", input=["single"])
+
+        assert len(result.embeddings) == 1
+        assert result.embeddings[0] == [0.1, 0.2]
+
+    def test_embed_empty_input_raises(self):
+        """embed() raises ValueError on empty input."""
+        from common.llm import OpenAICompatibleClient
+
+        client = OpenAICompatibleClient(api_key="test-key")
+        with pytest.raises(ValueError, match="Input texts are required"):
+            client.embed(model="text-embedding-3-small", input=[])
+
+    def test_embed_no_model_raises(self):
+        """embed() raises ValueError when model is empty."""
+        from common.llm import OpenAICompatibleClient
+
+        client = OpenAICompatibleClient(api_key="test-key")
+        with pytest.raises(ValueError, match="Model is required"):
+            client.embed(model="", input=["hello"])
+
+    @patch("requests.post")
+    def test_embed_sends_auth_headers(self, mock_post):
+        """embed() sends Authorization and OpenRouter headers."""
+        from common.llm import OpenAICompatibleClient
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [], "model": "m"}
+        mock_resp.raise_for_status.return_value = None
+        mock_post.return_value = mock_resp
+
+        client = OpenAICompatibleClient(
+            api_key="sk-test",
+            http_referer="https://example.com",
+            x_title="test-app",
+        )
+        client.embed(model="m", input=["x"])
+
+        headers = mock_post.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer sk-test"
+        assert headers["HTTP-Referer"] == "https://example.com"
+        assert headers["X-Title"] == "test-app"
+
+    def test_base_llm_client_embed_raises(self):
+        """Default LLMClient.embed() raises NotImplementedError."""
+        from common.llm import LLMClient
+
+        class DummyClient(LLMClient):
+            def create_message(self, **kw):
+                pass
+
+            def generate_json(self, **kw):
+                pass
+
+            def get_provider_name(self):
+                return "dummy"
+
+        client = DummyClient()
+        with pytest.raises(NotImplementedError, match="does not support embeddings"):
+            client.embed(model="m", input=["x"])
