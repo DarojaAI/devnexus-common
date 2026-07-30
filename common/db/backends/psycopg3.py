@@ -303,7 +303,9 @@ def _build_pool_kwargs(config: BackendConfig) -> dict:
     # setting), but we also pass it as a conn_kwarg so the ``configure``
     # callback can read it from the pool's conn_kwargs if needed.
     if config.search_path:
-        conn_kwargs["options"] = conn_kwargs.get("options", "") + f" -c search_path={config.search_path}"
+        conn_kwargs["options"] = (
+            conn_kwargs.get("options", "") + f" -c search_path={config.search_path}"
+        )
         conn_kwargs["options"] = conn_kwargs["options"].strip()
 
     if conn_kwargs:
@@ -444,8 +446,7 @@ class Psycopg3Backend:
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT extversion FROM pg_extension "
-                        "WHERE extname = 'vector'"
+                        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
                     )
                     row = await cur.fetchone()
             if row is not None:
@@ -534,8 +535,7 @@ class Psycopg3Backend:
                     version = version_row[0] if version_row is not None else None
 
                     await cur.execute(
-                        "SELECT extversion FROM pg_extension "
-                        "WHERE extname = 'vector'"
+                        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
                     )
                     pgvector_row = await cur.fetchone()
 
