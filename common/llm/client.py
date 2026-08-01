@@ -304,6 +304,109 @@ class LLMClient(ABC):
             f"{self.__class__.__name__} does not support embeddings"
         )
 
+    def embed_normalized(
+        self,
+        model: str,
+        input: List[str],
+        dim: Optional[int] = None,
+        normalize: bool = True,
+        batch_size: int = 50,
+        **kwargs,
+    ) -> List[List[float]]:
+        """Embed texts with optional L2-normalization and dimension padding.
+
+        Convenience wrapper around :meth:`embed` that adds batching,
+        L2-normalization, and zero-padding / truncation to a target
+        dimension.  This is the recommended entry point for embedding
+        call sites that store vectors in pgvector or other vector stores.
+
+        Args:
+            model: Embedding model identifier.
+            input: List of strings to embed.
+            dim: Target embedding dimension.  ``None`` skips pad/truncate.
+            normalize: L2-normalize each vector to unit length (default ``True``).
+            batch_size: Number of texts per API call (default 50).
+            **kwargs: Forwarded to :meth:`embed`.
+
+        Returns:
+            List of embedding vectors, one per input text.
+
+        Raises:
+            NotImplementedError: If the client does not support embeddings.
+        """
+        results: List[List[float]] = []
+        for i in range(0, len(input), batch_size):
+            batch = input[i : i + batch_size]
+            resp = self.embed(model=model, input=batch, **kwargs)
+            for vector in resp.embeddings:
+                if normalize:
+                    vector = normalize_and_pad(vector, dim=dim)
+                elif dim is not None:
+                    vector = _pad_or_truncate(vector, dim)
+                results.append(vector)
+        return results
+
+
+def normalize_and_pad(vector: List[float], dim: Optional[int] = None) -> List[float]:
+    """L2-normalize *vector* to unit length, then optionally pad/truncate to *dim*.
+
+    Args:
+        vector: Raw embedding from the API.
+        dim: Target dimension.  When provided the vector is truncated (if
+            longer) or zero-padded (if shorter).  ``None`` skips the
+            pad/truncate step and only normalizes.
+
+    Returns:
+        Normalized (and optionally padded/truncated) vector.
+    """
+    norm = sum(x * x for x in vector) ** 0.5
+    if norm > 0:
+        vector = [x / norm for x in vector]
+    if dim is not None:
+        vector = _pad_or_truncate(vector, dim)
+    return vector
+
+
+def _pad_or_truncate(vector: List[float], dim: int) -> List[float]:
+    """Pad or truncate *vector* to *dim* dimensions."""
+    if len(vector) >= dim:
+        return vector[:dim]
+    return vector + [0.0] * (dim - len(vector))
+
+
+def batch_embed(
+    client: "LLMClient",
+    texts: List[str],
+    model: str,
+    dim: Optional[int] = None,
+    normalize: bool = True,
+    batch_size: int = 50,
+) -> List[List[float]]:
+    """Standalone helper: embed *texts* with batching, normalization, and dim-pad.
+
+    This is a convenience wrapper that delegates to
+    ``client.embed_normalized()``.  Use this when you have a client
+    instance but prefer a functional API.
+
+    Args:
+        client: An ``LLMClient`` instance.
+        texts: Input strings to embed.
+        model: Embedding model identifier.
+        dim: Target embedding dimension (``None`` = no pad/truncate).
+        normalize: L2-normalize each vector (default ``True``).
+        batch_size: Texts per API call (default 50).
+
+    Returns:
+        List of embedding vectors.
+    """
+    return client.embed_normalized(
+        model=model,
+        input=texts,
+        dim=dim,
+        normalize=normalize,
+        batch_size=batch_size,
+    )
+
 
 class AnthropicClient(LLMClient):
     """Anthropic Claude client wrapper"""

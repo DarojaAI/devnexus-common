@@ -6,9 +6,12 @@ from common.llm.client import (
     OpenAIClient,
     AzureOpenAIClient,
     LLMResponse,
+    EmbeddingResponse,
     Message,
     get_llm_client,
     get_llm_client_from_config,
+    normalize_and_pad,
+    batch_embed,
 )
 
 __all__ = [
@@ -19,7 +22,10 @@ __all__ = [
     "OpenAIClient",
     "AzureOpenAIClient",
     "LLMResponse",
+    "EmbeddingResponse",
     "Message",
     "get_llm_client",
     "get_llm_client_from_config",
+    "normalize_and_pad",
+    "batch_embed",
 ]
