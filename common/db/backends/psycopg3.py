@@ -512,14 +512,26 @@ class Psycopg3Backend:
                 # syntactically invalid because of the surrounding
                 # quotes.
                 #
-                # CRITICAL: use autocommit=True to avoid leaving the
-                # connection in INTRANS state. psycopg_pool's configure
-                # callback must not leave connections in an open
-                # transaction, or the pool will discard them with
-                # "connection left in status INTRANS by configure
-                # function". Without autocommit, SET executes inside
-                # an implicit transaction that is never committed.
-                await conn.execute(f"SET search_path TO {search_path}", autocommit=True)
+                # CRITICAL: psycopg_pool's configure callback must not
+                # leave the connection in an open transaction. Without
+                # autocommit, ``SET search_path`` runs inside an
+                # implicit transaction; when the pool tries to reuse
+                # the connection, it sees INTRANS state and discards
+                # the connection with "connection left in status
+                # INTRANS by configure function". The correct psycopg 3
+                # API is ``conn.set_autocommit(True)`` -- ``conn.execute``
+                # does NOT accept an ``autocommit`` kwarg (the prior
+                # attempt did and was rejected with "got an unexpected
+                # keyword argument 'autocommit'" on PR #73).
+                # We restore autocommit=False afterwards so the
+                # connection's normal transactional mode is preserved
+                # for the callers that pull it from the pool.
+                prev_autocommit = conn.autocommit
+                try:
+                    await conn.set_autocommit(True)
+                    await conn.execute(f"SET search_path TO {search_path}")
+                finally:
+                    await conn.set_autocommit(prev_autocommit)
             if has_json and set_json_loaders is not None:
                 # json.dumps / json.loads gives the same behavior as
                 # asyncpg's auto-decode of jsonb to a Python object.
