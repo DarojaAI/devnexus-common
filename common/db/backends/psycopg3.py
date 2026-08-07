@@ -398,11 +398,14 @@ class Psycopg3Backend:
         # Stored so health_check() can report host/database; not used
         # for pool config after connect() returns.
         self._config: Optional[BackendConfig] = None
-        # Per-cursor timeout (seconds). Set from statement_timeout_ms
-        # so psycopg's client-side cancel fires in addition to the
-        # server-side ``statement_timeout`` GUC. The client-side cancel
-        # is mostly a backstop: in practice the server fires first.
-        self._cursor_timeout_s: Optional[float] = None
+        # NOTE: psycopg 3 does NOT expose ``cur.timeout`` as a cursor
+        # attribute and ``cur.execute(query, args, timeout=...)`` is
+        # not a valid kwarg (that is asyncpg's API). The server-side
+        # ``statement_timeout`` GUC set via libpq ``options=`` in
+        # ``_build_pool_kwargs`` is the only correct per-statement
+        # timeout. An earlier client-side backstop here was removed
+        # because the two wrong-API attempts (8ade1a2, 5b8da61, beb969f)
+        # each broke psycopg 3 in a different way. PR #73.
 
     # ------------------------------------------------------------------
     # Protocol: identity
@@ -430,12 +433,6 @@ class Psycopg3Backend:
         it isn't (the patterns helpers degrade gracefully either way).
         """
         self._config = config
-        self._cursor_timeout_s = (
-            config.statement_timeout_ms / 1000.0
-            if config.statement_timeout_ms and config.statement_timeout_ms > 0
-            else None
-        )
-
         pool_kwargs = _build_pool_kwargs(config)
         pool_kwargs["configure"] = self._build_configure(config)
 
@@ -633,27 +630,16 @@ class Psycopg3Backend:
         matching the asyncpg backend's return contract.
         """
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    # psycopg 3 takes the timeout as a cursor attribute,
-                    # not as a kwarg to execute(). Passing it as a kwarg
-                    # (the asyncpg shape) is rejected with
-                    # "AsyncCursor.execute() got an unexpected keyword
-                    # argument 'timeout'" (PR #73).
-                    cur.timeout = timeout
                 await cur.execute(query, args)
                 return cur.statusmessage or ""
 
     async def fetch(self, query: str, *args: Any) -> List[_RowAdapter]:
         """Fetch multiple rows. Each row is wrapped in :class:`_RowAdapter`."""
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    cur.timeout = timeout
                 await cur.execute(query, args)
                 rows = await cur.fetchall()
                 return [_RowAdapter(row) for row in rows]
@@ -661,11 +647,8 @@ class Psycopg3Backend:
     async def fetchrow(self, query: str, *args: Any) -> Optional[_RowAdapter]:
         """Fetch a single row, or ``None`` if no rows match."""
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    cur.timeout = timeout
                 await cur.execute(query, args)
                 row = await cur.fetchone()
                 return _RowAdapter(row) if row is not None else None
@@ -673,11 +656,8 @@ class Psycopg3Backend:
     async def fetchval(self, query: str, *args: Any) -> Any:
         """Fetch a single scalar value, or ``None`` if no rows match."""
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    cur.timeout = timeout
                 await cur.execute(query, args)
                 row = await cur.fetchone()
                 if row is None:
@@ -694,11 +674,8 @@ class Psycopg3Backend:
         multi-row INSERT / UPDATE / DELETE under the hood.
         """
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    cur.timeout = timeout
                 await cur.executemany(query, args)
 
     # ------------------------------------------------------------------
