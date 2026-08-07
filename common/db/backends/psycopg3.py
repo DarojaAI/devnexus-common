@@ -637,9 +637,13 @@ class Psycopg3Backend:
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
-                    await cur.execute(query, args, timeout=timeout)
-                else:
-                    await cur.execute(query, args)
+                    # psycopg 3 takes the timeout as a cursor attribute,
+                    # not as a kwarg to execute(). Passing it as a kwarg
+                    # (the asyncpg shape) is rejected with
+                    # "AsyncCursor.execute() got an unexpected keyword
+                    # argument 'timeout'" (PR #73).
+                    cur.timeout = timeout
+                await cur.execute(query, args)
                 return cur.statusmessage or ""
 
     async def fetch(self, query: str, *args: Any) -> List[_RowAdapter]:
@@ -649,9 +653,8 @@ class Psycopg3Backend:
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
-                    await cur.execute(query, args, timeout=timeout)
-                else:
-                    await cur.execute(query, args)
+                    cur.timeout = timeout
+                await cur.execute(query, args)
                 rows = await cur.fetchall()
                 return [_RowAdapter(row) for row in rows]
 
@@ -662,9 +665,8 @@ class Psycopg3Backend:
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
-                    await cur.execute(query, args, timeout=timeout)
-                else:
-                    await cur.execute(query, args)
+                    cur.timeout = timeout
+                await cur.execute(query, args)
                 row = await cur.fetchone()
                 return _RowAdapter(row) if row is not None else None
 
@@ -675,9 +677,8 @@ class Psycopg3Backend:
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
-                    await cur.execute(query, args, timeout=timeout)
-                else:
-                    await cur.execute(query, args)
+                    cur.timeout = timeout
+                await cur.execute(query, args)
                 row = await cur.fetchone()
                 if row is None:
                     return None
@@ -697,9 +698,8 @@ class Psycopg3Backend:
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
-                    await cur.executemany(query, args, timeout=timeout)
-                else:
-                    await cur.executemany(query, args)
+                    cur.timeout = timeout
+                await cur.executemany(query, args)
 
     # ------------------------------------------------------------------
     # Protocol: patterns helpers (rag_research_tool)
