@@ -442,8 +442,18 @@ class Psycopg3Backend:
         if psycopg_pool is None:  # pragma: no cover - guard above covers this
             raise ImportError("psycopg_pool is not installed")
 
+        # psycopg_pool.AsyncConnectionPool.open's default timeout is 30s.
+        # That default is too short for cold-start scenarios (CI
+        # containers, serverless cold starts, fresh DB clusters where
+        # initdb + first connection + TLS handshake have to fit in
+        # the budget). 30s was confirmed too short on the
+        # devnexus-common-stress.yml job (PR #73) where the psycopg 3
+        # path timed out with "couldn't get a connection after 30.00
+        # sec" while the asyncpg path on the same container succeeded.
+        # 60s gives the cold-start room without making genuinely-broken
+        # connections hang the caller indefinitely.
         self.pool = psycopg_pool.AsyncConnectionPool(**pool_kwargs)
-        await self.pool.open(wait=True)
+        await self.pool.open(wait=True, timeout=60.0)
 
         # Best-effort pgvector probe. The probe runs against a
         # connection from the pool so the same per-connection settings
