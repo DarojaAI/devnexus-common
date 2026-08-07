@@ -220,6 +220,48 @@ class TestPsycopg3BackendBasics:
             assert hasattr(backend, name), f"missing method: {name}"
             assert callable(getattr(backend, name)), f"not callable: {name}"
 
+    def test_pool_attribute_is_public_for_manager_compatibility(self):
+        """``pool`` is a public attribute (not ``_pool``).
+
+        Regression test for the devnexus-common-stress.yml nightly
+        job's psycopg 3 parametrization, which was failing with
+        ``AttributeError: 'Psycopg3Backend' object has no attribute
+        'pool'``. Root cause: ``DatabaseManager.connect`` does
+        ``self.pool = self._backend.pool`` so the manager can read
+        through ``self.pool`` uniformly across backends. The asyncpg
+        backend exposes ``self.pool``; the psycopg 3 backend used
+        ``self._pool`` (private), so the assignment raised
+        ``AttributeError`` the first time the manager ran against
+        a real PG with ``backend="psycopg3"``.
+
+        Fix: rename ``_pool`` → ``pool`` in ``Psycopg3Backend`` so
+        both backends expose the same public attribute name. This
+        test pins down:
+
+          1. The attribute exists and is publicly accessible.
+          2. It starts as ``None`` (set by ``connect()``).
+          3. It can be reassigned (the manager's connect path
+             does ``self.pool = self._backend.pool``).
+
+        If a future refactor reintroduces ``_pool`` (or any other
+        private name), this test catches it before the stress
+        CI does.
+        """
+        backend = Psycopg3Backend()
+        # Public attribute must exist.
+        assert hasattr(backend, "pool"), (
+            "Psycopg3Backend must expose a public `pool` attribute "
+            "for DatabaseManager.connect to sync it via "
+            "`self.pool = self._backend.pool`. The previous private "
+            "name `_pool` caused AttributeError in the nightly "
+            "stress test's psycopg 3 parametrization."
+        )
+        assert backend.pool is None
+        # Reassignable. The manager's connect path assigns to it.
+        sentinel = object()
+        backend.pool = sentinel
+        assert backend.pool is sentinel
+
 
 # ---------------------------------------------------------------------------
 # Row adapter
@@ -248,9 +290,9 @@ class TestRowAdapter:
         inner = _make_psycopg_row(data)
         # Add positional access to the mock: row[0] -> list(data.values())[0]
         inner.__getitem__ = MagicMock(
-            side_effect=lambda k: list(data.values())[k]
-            if isinstance(k, int)
-            else data[k]
+            side_effect=lambda k: (
+                list(data.values())[k] if isinstance(k, int) else data[k]
+            )
         )
         adapter = _RowAdapter(inner)
         assert adapter[0] == 1
@@ -503,7 +545,7 @@ class TestHealthCheck:
         # side_effect as ``return_value``, which made ``fetchone`` always
         # return that MagicMock (not the tuples) and the backend then
         # got ``MagicMock.__getitem__()`` instead of the string.
-        backend._pool = _make_mock_pool(
+        backend.pool = _make_mock_pool(
             cursor_fetchone=AsyncMock(
                 side_effect=[
                     ("PostgreSQL 16.0 on x86_64",),  # version()
@@ -527,7 +569,7 @@ class TestHealthCheck:
         cm.__aenter__ = AsyncMock(side_effect=RuntimeError("boom"))
         cm.__aexit__ = AsyncMock(return_value=None)
         mock_pool.connection = MagicMock(return_value=cm)
-        backend._pool = mock_pool
+        backend.pool = mock_pool
         backend._config = _make_config()
 
         result = await backend.health_check()
@@ -538,7 +580,7 @@ class TestHealthCheck:
     async def test_health_check_returns_disconnected_when_pool_is_none(self):
         """Without an open pool, the result is ``{status: 'disconnected'}``."""
         backend = Psycopg3Backend()
-        assert backend._pool is None
+        assert backend.pool is None
         result = await backend.health_check()
         assert result["status"] == "disconnected"
         assert "No active connection pool" in result["message"]
@@ -570,7 +612,7 @@ class TestQueryExecution:
         conn_cm.__aenter__ = AsyncMock(return_value=mock_conn)
         conn_cm.__aexit__ = AsyncMock(return_value=None)
         mock_pool.connection = MagicMock(return_value=conn_cm)
-        backend._pool = mock_pool
+        backend.pool = mock_pool
 
         result = await backend.execute("INSERT INTO t VALUES (%s)", 1)
         assert result == "INSERT 0 7"
@@ -669,7 +711,7 @@ class TestQueryExecution:
     def test_acquire_raises_when_disconnected(self):
         """``acquire()`` raises ``RuntimeError`` when the pool is not connected."""
         backend = Psycopg3Backend()
-        assert backend._pool is None
+        assert backend.pool is None
         with pytest.raises(RuntimeError, match="Database not connected"):
             backend.acquire()
 
@@ -679,7 +721,7 @@ class TestQueryExecution:
         cm = MagicMock(name="acm")
         mock_pool = MagicMock()
         mock_pool.connection = MagicMock(return_value=cm)
-        backend._pool = mock_pool
+        backend.pool = mock_pool
         result = backend.acquire()
         assert result is cm
         mock_pool.connection.assert_called_once_with()
@@ -699,7 +741,7 @@ def _install_mock_pool_with_cursor(
     conn_cm.__aexit__ = AsyncMock(return_value=None)
     mock_pool = MagicMock()
     mock_pool.connection = MagicMock(return_value=conn_cm)
-    backend._pool = mock_pool
+    backend.pool = mock_pool
     return mock_pool
 
 

@@ -353,14 +353,22 @@ class Psycopg3Backend:
     (the ``configure`` callback), and the row adapter.
 
     The instance is a regular class, not a dataclass: it holds mutable
-    driver state (``self._pool``) that changes over the lifetime of
+    driver state (``self.pool``) that changes over the lifetime of
     the connection, and every Protocol method besides ``name`` and
     ``acquire`` is a coroutine.
+
+    Note: ``self.pool`` is the public reference the ``DatabaseManager``
+    syncs from (``self.pool = self._backend.pool`` in
+    ``DatabaseManager.connect``). It was previously named ``self._pool``;
+    the rename aligns with :class:`AsyncpgBackend` so both backends
+    expose the same attribute name and the manager's connect path works
+    uniformly. ``self._pool`` and ``self._backend._pool`` are no longer
+    valid; the attribute is now ``self.pool`` on every backend.
     """
 
     def __init__(self) -> None:
         # Set by connect(); None until the pool is open.
-        self._pool: Optional[Any] = None
+        self.pool: Optional[Any] = None
         # Stored so health_check() can report host/database; not used
         # for pool config after connect() returns.
         self._config: Optional[BackendConfig] = None
@@ -408,8 +416,8 @@ class Psycopg3Backend:
         if psycopg_pool is None:  # pragma: no cover - guard above covers this
             raise ImportError("psycopg_pool is not installed")
 
-        self._pool = psycopg_pool.AsyncConnectionPool(**pool_kwargs)
-        await self._pool.open(wait=True)
+        self.pool = psycopg_pool.AsyncConnectionPool(**pool_kwargs)
+        await self.pool.open(wait=True)
 
         # Best-effort pgvector probe. The probe runs against a
         # connection from the pool so the same per-connection settings
@@ -417,11 +425,10 @@ class Psycopg3Backend:
         # itself fails (network blip, missing privileges) we just log
         # a warning rather than failing the whole connect().
         try:
-            async with self._pool.connection() as conn:
+            async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT extversion FROM pg_extension "
-                        "WHERE extname = 'vector'"
+                        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
                     )
                     row = await cur.fetchone()
             if row is not None:
@@ -482,9 +489,9 @@ class Psycopg3Backend:
 
     async def disconnect(self) -> None:
         """Close the connection pool. Idempotent."""
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        if self.pool is not None:
+            await self.pool.close()
+            self.pool = None
             logger.info("Database connection pool closed (psycopg3)")
 
     # ------------------------------------------------------------------
@@ -499,19 +506,18 @@ class Psycopg3Backend:
         field is one of ``"healthy"``, ``"unhealthy"``, or
         ``"disconnected"``.
         """
-        if self._pool is None:
+        if self.pool is None:
             return {"status": "disconnected", "message": "No active connection pool"}
 
         try:
-            async with self._pool.connection() as conn:
+            async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("SELECT version()")
                     version_row = await cur.fetchone()
                     version = version_row[0] if version_row is not None else None
 
                     await cur.execute(
-                        "SELECT extversion FROM pg_extension "
-                        "WHERE extname = 'vector'"
+                        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
                     )
                     pgvector_row = await cur.fetchone()
 
@@ -551,9 +557,9 @@ class Psycopg3Backend:
         backend's own ``acquire()`` (or through the four ``_*_impl``
         helpers which already dispatch).
         """
-        if self._pool is None:
+        if self.pool is None:
             raise RuntimeError("Database not connected")
-        return self._pool.connection()
+        return self.pool.connection()
 
     # ------------------------------------------------------------------
     # Protocol: basic query helpers
@@ -570,9 +576,9 @@ class Psycopg3Backend:
         Returns the command's status string (``"INSERT 0 1"`` etc.),
         matching the asyncpg backend's return contract.
         """
-        assert self._pool is not None, "Database not connected"
+        assert self.pool is not None, "Database not connected"
         timeout = self._cursor_timeout_s
-        async with self._pool.connection() as conn:
+        async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
                     await cur.execute(query, args, timeout=timeout)
@@ -582,9 +588,9 @@ class Psycopg3Backend:
 
     async def fetch(self, query: str, *args: Any) -> List[_RowAdapter]:
         """Fetch multiple rows. Each row is wrapped in :class:`_RowAdapter`."""
-        assert self._pool is not None, "Database not connected"
+        assert self.pool is not None, "Database not connected"
         timeout = self._cursor_timeout_s
-        async with self._pool.connection() as conn:
+        async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
                     await cur.execute(query, args, timeout=timeout)
@@ -595,9 +601,9 @@ class Psycopg3Backend:
 
     async def fetchrow(self, query: str, *args: Any) -> Optional[_RowAdapter]:
         """Fetch a single row, or ``None`` if no rows match."""
-        assert self._pool is not None, "Database not connected"
+        assert self.pool is not None, "Database not connected"
         timeout = self._cursor_timeout_s
-        async with self._pool.connection() as conn:
+        async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
                     await cur.execute(query, args, timeout=timeout)
@@ -608,9 +614,9 @@ class Psycopg3Backend:
 
     async def fetchval(self, query: str, *args: Any) -> Any:
         """Fetch a single scalar value, or ``None`` if no rows match."""
-        assert self._pool is not None, "Database not connected"
+        assert self.pool is not None, "Database not connected"
         timeout = self._cursor_timeout_s
-        async with self._pool.connection() as conn:
+        async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
                     await cur.execute(query, args, timeout=timeout)
@@ -630,9 +636,9 @@ class Psycopg3Backend:
         positional-arg tuples; psycopg will adapt it to a single
         multi-row INSERT / UPDATE / DELETE under the hood.
         """
-        assert self._pool is not None, "Database not connected"
+        assert self.pool is not None, "Database not connected"
         timeout = self._cursor_timeout_s
-        async with self._pool.connection() as conn:
+        async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
                 if timeout is not None:
                     await cur.executemany(query, args, timeout=timeout)
