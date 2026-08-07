@@ -35,6 +35,12 @@ on:
   schedule:
     - cron: "0 6 * * 0"  # weekly Sunday (was daily; trimmed 2026-08-07)
   workflow_dispatch:
+    inputs:
+      heavy:
+        description: "Run the 50-task heavy stress variant on both backends"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -87,7 +93,7 @@ jobs:
 
       - name: Run minimal concurrent-cancellation stress test (asyncpg)
         env:
-          POSTGRES_HOST: localhost
+          POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "5432"
           POSTGRES_USER: stress
           POSTGRES_PASSWORD: stress
@@ -151,7 +157,7 @@ jobs:
 
       - name: Run minimal concurrent-cancellation stress test (psycopg 3)
         env:
-          POSTGRES_HOST: localhost
+          POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "5432"
           POSTGRES_USER: stress
           POSTGRES_PASSWORD: stress
@@ -231,7 +237,7 @@ jobs:
 
       - name: Run heavy concurrent-cancellation stress test
         env:
-          POSTGRES_HOST: localhost
+          POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "5432"
           POSTGRES_USER: stress
           POSTGRES_PASSWORD: stress
