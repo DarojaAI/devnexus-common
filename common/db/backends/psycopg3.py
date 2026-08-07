@@ -511,7 +511,15 @@ class Psycopg3Backend:
                 # where ``SET search_path TO 'public'`` becomes
                 # syntactically invalid because of the surrounding
                 # quotes.
-                await conn.execute(f"SET search_path TO {search_path}")
+                #
+                # CRITICAL: use autocommit=True to avoid leaving the
+                # connection in INTRANS state. psycopg_pool's configure
+                # callback must not leave connections in an open
+                # transaction, or the pool will discard them with
+                # "connection left in status INTRANS by configure
+                # function". Without autocommit, SET executes inside
+                # an implicit transaction that is never committed.
+                await conn.execute(f"SET search_path TO {search_path}", autocommit=True)
             if has_json and set_json_loaders is not None:
                 # json.dumps / json.loads gives the same behavior as
                 # asyncpg's auto-decode of jsonb to a Python object.
