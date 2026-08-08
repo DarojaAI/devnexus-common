@@ -633,13 +633,31 @@ class DatabaseManager:
         # The test path sets ``self.pool`` directly after a
         # ``__new__``-bypass; the backend would not see that pool.
         # The probe SQL is identical for both asyncpg and psycopg 3,
-        # so there's no backend-specific work to delegate.
+        # so there's no backend-specific work to delegate — but the
+        # pool's acquire API differs: asyncpg exposes ``.acquire()``,
+        # psycopg 3's ``AsyncConnectionPool`` exposes ``.connection()``
+        # and has no ``.acquire()``. Dispatch on the backend when set.
+        backend = getattr(self, "_backend", None)
         try:
-            async with self.pool.acquire() as conn:
-                version = await conn.fetchval("SELECT version()")
-                ext = await conn.fetchrow(
-                    "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
-                )
+            if backend is not None and getattr(backend, "name", "") != "asyncpg":
+                # psycopg 3 path: backend.acquire() returns the pool's
+                # native async context manager (.connection()).
+                async with backend.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT version()")
+                        v = await cur.fetchone()
+                        version = v[0] if v else None
+                        await cur.execute(
+                            "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+                        )
+                        e = await cur.fetchone()
+                    ext = {"extversion": e[0]} if e else None
+            else:
+                async with self.pool.acquire() as conn:
+                    version = await conn.fetchval("SELECT version()")
+                    ext = await conn.fetchrow(
+                        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+                    )
         except Exception as e:
             return {
                 "status": "unhealthy",
@@ -652,12 +670,31 @@ class DatabaseManager:
             "pgvector": ext["extversion"] if ext else None,
         }
 
-        live_pool = {
-            "size": self.pool.get_size(),
-            "free": self.pool.get_idle_size(),
-            "min": self.pool.get_min_size(),
-            "max": self.pool.get_max_size(),
-        }
+        # asyncpg's pool exposes .get_size()/.get_idle_size()/.get_min_size()/
+        # .get_max_size(); psycopg 3's AsyncConnectionPool exposes
+        # .min_size / .max_size attributes and a .get_stats() method
+        # returning a dict with pool stats. Dispatch the same way as
+        # the acquire() path above so health_check_sync doesn't crash
+        # on psycopg3 setups.
+        backend = getattr(self, "_backend", None)
+        if backend is not None and getattr(backend, "name", "") != "asyncpg":
+            try:
+                stats = self.pool.get_stats()
+            except Exception:
+                stats = {}
+            live_pool = {
+                "size": stats.get("pool_size"),
+                "free": stats.get("pool_available"),
+                "min": getattr(self.pool, "min_size", None),
+                "max": getattr(self.pool, "max_size", None),
+            }
+        else:
+            live_pool = {
+                "size": self.pool.get_size(),
+                "free": self.pool.get_idle_size(),
+                "min": self.pool.get_min_size(),
+                "max": self.pool.get_max_size(),
+            }
         saturation = self._stats.summary()
         return {
             **probe,

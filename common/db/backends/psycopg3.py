@@ -398,11 +398,14 @@ class Psycopg3Backend:
         # Stored so health_check() can report host/database; not used
         # for pool config after connect() returns.
         self._config: Optional[BackendConfig] = None
-        # Per-cursor timeout (seconds). Set from statement_timeout_ms
-        # so psycopg's client-side cancel fires in addition to the
-        # server-side ``statement_timeout`` GUC. The client-side cancel
-        # is mostly a backstop: in practice the server fires first.
-        self._cursor_timeout_s: Optional[float] = None
+        # NOTE: psycopg 3 does NOT expose ``cur.timeout`` as a cursor
+        # attribute and ``cur.execute(query, args, timeout=...)`` is
+        # not a valid kwarg (that is asyncpg's API). The server-side
+        # ``statement_timeout`` GUC set via libpq ``options=`` in
+        # ``_build_pool_kwargs`` is the only correct per-statement
+        # timeout. An earlier client-side backstop here was removed
+        # because the two wrong-API attempts (8ade1a2, 5b8da61, beb969f)
+        # each broke psycopg 3 in a different way. PR #73.
 
     # ------------------------------------------------------------------
     # Protocol: identity
@@ -430,20 +433,24 @@ class Psycopg3Backend:
         it isn't (the patterns helpers degrade gracefully either way).
         """
         self._config = config
-        self._cursor_timeout_s = (
-            config.statement_timeout_ms / 1000.0
-            if config.statement_timeout_ms and config.statement_timeout_ms > 0
-            else None
-        )
-
         pool_kwargs = _build_pool_kwargs(config)
         pool_kwargs["configure"] = self._build_configure(config)
 
         if psycopg_pool is None:  # pragma: no cover - guard above covers this
             raise ImportError("psycopg_pool is not installed")
 
+        # psycopg_pool.AsyncConnectionPool.open's default timeout is 30s.
+        # That default is too short for cold-start scenarios (CI
+        # containers, serverless cold starts, fresh DB clusters where
+        # initdb + first connection + TLS handshake have to fit in
+        # the budget). 30s was confirmed too short on the
+        # devnexus-common-stress.yml job (PR #73) where the psycopg 3
+        # path timed out with "couldn't get a connection after 30.00
+        # sec" while the asyncpg path on the same container succeeded.
+        # 60s gives the cold-start room without making genuinely-broken
+        # connections hang the caller indefinitely.
         self.pool = psycopg_pool.AsyncConnectionPool(**pool_kwargs)
-        await self.pool.open(wait=True)
+        await self.pool.open(wait=True, timeout=60.0)
 
         # Best-effort pgvector probe. The probe runs against a
         # connection from the pool so the same per-connection settings
@@ -501,7 +508,27 @@ class Psycopg3Backend:
                 # where ``SET search_path TO 'public'`` becomes
                 # syntactically invalid because of the surrounding
                 # quotes.
-                await conn.execute(f"SET search_path TO {search_path}")
+                #
+                # CRITICAL: psycopg_pool's configure callback must not
+                # leave the connection in an open transaction. Without
+                # autocommit, ``SET search_path`` runs inside an
+                # implicit transaction; when the pool tries to reuse
+                # the connection, it sees INTRANS state and discards
+                # the connection with "connection left in status
+                # INTRANS by configure function". The correct psycopg 3
+                # API is ``conn.set_autocommit(True)`` -- ``conn.execute``
+                # does NOT accept an ``autocommit`` kwarg (the prior
+                # attempt did and was rejected with "got an unexpected
+                # keyword argument 'autocommit'" on PR #73).
+                # We restore autocommit=False afterwards so the
+                # connection's normal transactional mode is preserved
+                # for the callers that pull it from the pool.
+                prev_autocommit = conn.autocommit
+                try:
+                    await conn.set_autocommit(True)
+                    await conn.execute(f"SET search_path TO {search_path}")
+                finally:
+                    await conn.set_autocommit(prev_autocommit)
             if has_json and set_json_loaders is not None:
                 # json.dumps / json.loads gives the same behavior as
                 # asyncpg's auto-decode of jsonb to a Python object.
@@ -603,51 +630,35 @@ class Psycopg3Backend:
         matching the asyncpg backend's return contract.
         """
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    await cur.execute(query, args, timeout=timeout)
-                else:
-                    await cur.execute(query, args)
+                await cur.execute(query, args)
                 return cur.statusmessage or ""
 
     async def fetch(self, query: str, *args: Any) -> List[_RowAdapter]:
         """Fetch multiple rows. Each row is wrapped in :class:`_RowAdapter`."""
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    await cur.execute(query, args, timeout=timeout)
-                else:
-                    await cur.execute(query, args)
+                await cur.execute(query, args)
                 rows = await cur.fetchall()
                 return [_RowAdapter(row) for row in rows]
 
     async def fetchrow(self, query: str, *args: Any) -> Optional[_RowAdapter]:
         """Fetch a single row, or ``None`` if no rows match."""
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    await cur.execute(query, args, timeout=timeout)
-                else:
-                    await cur.execute(query, args)
+                await cur.execute(query, args)
                 row = await cur.fetchone()
                 return _RowAdapter(row) if row is not None else None
 
     async def fetchval(self, query: str, *args: Any) -> Any:
         """Fetch a single scalar value, or ``None`` if no rows match."""
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    await cur.execute(query, args, timeout=timeout)
-                else:
-                    await cur.execute(query, args)
+                await cur.execute(query, args)
                 row = await cur.fetchone()
                 if row is None:
                     return None
@@ -663,13 +674,9 @@ class Psycopg3Backend:
         multi-row INSERT / UPDATE / DELETE under the hood.
         """
         assert self.pool is not None, "Database not connected"
-        timeout = self._cursor_timeout_s
         async with self.pool.connection() as conn:
             async with conn.cursor() as cur:
-                if timeout is not None:
-                    await cur.executemany(query, args, timeout=timeout)
-                else:
-                    await cur.executemany(query, args)
+                await cur.executemany(query, args)
 
     # ------------------------------------------------------------------
     # Protocol: patterns helpers (rag_research_tool)

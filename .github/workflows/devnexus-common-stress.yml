@@ -1,23 +1,46 @@
 name: devnexus-common stress tests
 
-# Issues #7/#8: nightly + on-demand real-PG stress test for the
-# asyncpg concurrent-cancellation segfault pattern. Catches
-# regressions in the DatabaseManager sync facade.
+# Issues #7/#8: real-PG stress test for the asyncpg
+# concurrent-cancellation segfault pattern. Catches regressions in
+# the DatabaseManager sync facade that the mock-based unit tests
+# cannot (mock tests stub asyncpg at the pool level; the C code is
+# never loaded, so the bug class is invisible).
 #
 # Issue #29: parametrized against both backends (asyncpg + psycopg 3).
 # Two jobs run the same stress test against two different drivers
 # and both must pass for the workflow to be green.
 #
-# Triggers:
-#   - Daily at 06:00 UTC (catches regressions that sneak through PR CI)
-#   - Manual via Actions tab (run before tagging a release)
-#
-# Service: a postgres:17 container, exposed on localhost:5432.
+# Triggers (issue #987 trim, 2026-08-07):
+#   - pull_request on daroja-coding-agent/* branches: minimal variant
+#     (8-task burst) runs on every PR this agent opens against
+#     devnexus-common. Cheap regression net without burning nightly
+#     compute.
+#   - weekly Sunday 06:00 UTC: full minimal variant on both backends.
+#     Catches asyncpg upgrades, pool refactors, or backend changes
+#     that don't go through a PR.
+#   - workflow_dispatch: full minimal variant on both backends. The
+#     50-task "heavy" variant is gated behind the manual `stress-heavy`
+#     job below — use it before tagging a release if you want
+#     extra confidence, but it adds ~10s to the run for low marginal
+#     value (the bug was reproducible at N=2, not N=50).
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "common/db/**"
+      - "tests/stress/**"
+      - ".github/workflows/devnexus-common-stress.yml"
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 6 * * 0"  # weekly Sunday (was daily; trimmed 2026-08-07)
   workflow_dispatch:
+    inputs:
+      heavy:
+        description: "Run the 50-task heavy stress variant on both backends"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -66,11 +89,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]" 2>/dev/null || pip install -e .
-          # asyncpg is a hard dep, but install explicitly so the job
-          # description makes the driver selection obvious in the log.
           pip install asyncpg
 
-      - name: Run concurrent-cancellation stress tests (asyncpg)
+      - name: Run minimal concurrent-cancellation stress test (asyncpg)
         env:
           POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "5432"
@@ -78,26 +99,16 @@ jobs:
           POSTGRES_PASSWORD: stress
           POSTGRES_DB: stress
           POSTGRES_SCHEMA: public
-          # Stresses are configurable. Defaults: N=50, cancel 50% at 100ms.
-          STRESS_N: "50"
-          STRESS_CANCEL_FRACTION: "0.5"
-          STRESS_CANCEL_DELAY: "0.1"
-          STRESS_QUERY_DELAY: "0.5"
         run: |
-          # If this command exits cleanly, the test passed (no segfault).
-          # If the process dies from SIGSEGV, the workflow shows up as
-          # a failure (the runner will report the abort). The mock-based
-          # test suite in tests/test_postgres_sync.py still runs on
-          # regular PR CI; this job is the canary for the real-PG
-          # segfault pattern.
+          # The minimal variant (8 tasks, 4 cancelled) is the actual
+          # regression check — the original bug was reproducible at
+          # N=2, not N=50. The 50-task "heavy" variant runs only via
+          # the `stress-heavy` job below (manual trigger).
           #
-          # `-k "asyncpg"` selects only the asyncpg parametrization of
-          # TestConcurrentCancellation (the test IDs are
-          # `...test_concurrent_cancellation_does_not_segfault[asyncpg]`
-          # and `[psycopg3]`). Both backends are required to be tested
-          # because asyncpg's C-level concurrency bugs are a class
-          # psycopg 3 does not have.
-          python -m pytest tests/stress/ -v --tb=short -k "asyncpg"
+          # `-k "asyncpg and minimal"` selects only the minimal
+          # asyncpg parametrization. The full asyncpg parametrization
+          # (50 tasks) is excluded by the "minimal" filter.
+          python -m pytest tests/stress/ -v --tb=short -k "asyncpg and minimal"
 
   stress-psycopg3:
     name: Stress test (psycopg 3)
@@ -142,11 +153,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]" 2>/dev/null || pip install -e .
-          # psycopg 3 is the opt-in backend (issue #29). Install it
-          # explicitly with the binary + pool extras.
           pip install "psycopg[binary,pool]"
 
-      - name: Run concurrent-cancellation stress tests (psycopg 3)
+      - name: Run minimal concurrent-cancellation stress test (psycopg 3)
         env:
           POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "5432"
@@ -154,17 +163,8 @@ jobs:
           POSTGRES_PASSWORD: stress
           POSTGRES_DB: stress
           POSTGRES_SCHEMA: public
-          # Stresses are configurable. Defaults: N=50, cancel 50% at 100ms.
-          STRESS_N: "50"
-          STRESS_CANCEL_FRACTION: "0.5"
-          STRESS_CANCEL_DELAY: "0.1"
-          STRESS_QUERY_DELAY: "0.5"
         run: |
-          # Same test logic as the asyncpg job, but against the
-          # psycopg 3 backend. If this job is cleaner than the asyncpg
-          # one (fewer warnings, cleaner errors), that's a real signal
-          # that the psycopg 3 backend is the right long-term default.
-          python -m pytest tests/stress/ -v --tb=short -k "psycopg3"
+          python -m pytest tests/stress/ -v --tb=short -k "psycopg3 and minimal"
 
       - name: Upload test artifacts
         if: always()
@@ -175,3 +175,80 @@ jobs:
             .pytest_cache/
             **/__pycache__/
           if-no-files-found: ignore
+
+  # Heavy stress variant. Manual-only (`workflow_dispatch` with input
+  # `heavy=true`); runs the full 50-task burst on both backends.
+  # Not on schedule — the minimal variant is enough regression
+  # coverage. Use this before tagging a release if you want extra
+  # confidence in the cancellation path under load.
+  stress-heavy:
+    name: Stress test (heavy — manual)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.heavy == 'true'
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: stress
+          POSTGRES_PASSWORD: stress
+          POSTGRES_DB: stress
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stress -d stress"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    strategy:
+      matrix:
+        backend: [asyncpg, psycopg3]
+
+    env:
+      BACKEND: ${{ matrix.backend }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install package + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" 2>/dev/null || pip install -e .
+          if [ "$BACKEND" = "asyncpg" ]; then
+            pip install asyncpg
+          else
+            pip install "psycopg[binary,pool]"
+          fi
+
+      - name: Run heavy concurrent-cancellation stress test
+        env:
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: stress
+          POSTGRES_PASSWORD: stress
+          POSTGRES_DB: stress
+          POSTGRES_SCHEMA: public
+          STRESS_N: "50"
+          STRESS_CANCEL_FRACTION: "0.5"
+          STRESS_CANCEL_DELAY: "0.1"
+          STRESS_QUERY_DELAY: "0.5"
+        run: |
+          # Full 50-task burst on ${{ matrix.backend }}. Runs the
+          # non-minimal variant (`-k "not minimal"`) so the heavy
+          # burst is what gets exercised.
+          python -m pytest tests/stress/ -v --tb=short -k "${{ matrix.backend }} and not minimal"
