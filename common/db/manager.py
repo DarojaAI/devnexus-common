@@ -633,13 +633,31 @@ class DatabaseManager:
         # The test path sets ``self.pool`` directly after a
         # ``__new__``-bypass; the backend would not see that pool.
         # The probe SQL is identical for both asyncpg and psycopg 3,
-        # so there's no backend-specific work to delegate.
+        # so there's no backend-specific work to delegate — but the
+        # pool's acquire API differs: asyncpg exposes ``.acquire()``,
+        # psycopg 3's ``AsyncConnectionPool`` exposes ``.connection()``
+        # and has no ``.acquire()``. Dispatch on the backend when set.
+        backend = getattr(self, "_backend", None)
         try:
-            async with self.pool.acquire() as conn:
-                version = await conn.fetchval("SELECT version()")
-                ext = await conn.fetchrow(
-                    "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
-                )
+            if backend is not None and getattr(backend, "name", "") != "asyncpg":
+                # psycopg 3 path: backend.acquire() returns the pool's
+                # native async context manager (.connection()).
+                async with backend.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT version()")
+                        v = await cur.fetchone()
+                        version = v[0] if v else None
+                        await cur.execute(
+                            "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+                        )
+                        e = await cur.fetchone()
+                    ext = {"extversion": e[0]} if e else None
+            else:
+                async with self.pool.acquire() as conn:
+                    version = await conn.fetchval("SELECT version()")
+                    ext = await conn.fetchrow(
+                        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+                    )
         except Exception as e:
             return {
                 "status": "unhealthy",
