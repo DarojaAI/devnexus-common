@@ -670,12 +670,31 @@ class DatabaseManager:
             "pgvector": ext["extversion"] if ext else None,
         }
 
-        live_pool = {
-            "size": self.pool.get_size(),
-            "free": self.pool.get_idle_size(),
-            "min": self.pool.get_min_size(),
-            "max": self.pool.get_max_size(),
-        }
+        # asyncpg's pool exposes .get_size()/.get_idle_size()/.get_min_size()/
+        # .get_max_size(); psycopg 3's AsyncConnectionPool exposes
+        # .min_size / .max_size attributes and a .get_stats() method
+        # returning a dict with pool stats. Dispatch the same way as
+        # the acquire() path above so health_check_sync doesn't crash
+        # on psycopg3 setups.
+        backend = getattr(self, "_backend", None)
+        if backend is not None and getattr(backend, "name", "") != "asyncpg":
+            try:
+                stats = self.pool.get_stats()
+            except Exception:
+                stats = {}
+            live_pool = {
+                "size": stats.get("pool_size"),
+                "free": stats.get("pool_available"),
+                "min": getattr(self.pool, "min_size", None),
+                "max": getattr(self.pool, "max_size", None),
+            }
+        else:
+            live_pool = {
+                "size": self.pool.get_size(),
+                "free": self.pool.get_idle_size(),
+                "min": self.pool.get_min_size(),
+                "max": self.pool.get_max_size(),
+            }
         saturation = self._stats.summary()
         return {
             **probe,
